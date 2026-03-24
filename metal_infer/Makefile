@@ -38,7 +38,11 @@ INFER_SRC = infer.m
 CHAT_TARGET = chat
 CHAT_SRC = chat.m
 
-.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run chat-run build-chat
+# OpenAI-compatible API server
+SERVER_TARGET = server
+SERVER_SRC = server.m
+
+.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run chat-run build-chat server
 
 all: $(TARGET) $(INFER_TARGET)
 
@@ -63,8 +67,16 @@ $(INFER_TARGET): $(INFER_SRC)
 $(CHAT_TARGET): $(CHAT_SRC) linenoise.c linenoise.h
 	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) linenoise.c -o $(CHAT_TARGET)
 
+# Build the OpenAI-compatible API server
+# Compiles infer.m as a library (no main), links with server.m
+infer.o: $(INFER_SRC) infer_api.h
+	$(CC) $(CFLAGS) -DINFER_LIB_MODE -c $(INFER_SRC) -o infer.o
+
+$(SERVER_TARGET): $(SERVER_SRC) infer.o infer_api.h
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(SERVER_SRC) infer.o -o $(SERVER_TARGET)
+
 clean:
-	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
+	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SERVER_TARGET) infer.o $(SHADER_AIR) $(SHADER_LIB)
 
 # Run targets
 run: $(TARGET)

@@ -71,75 +71,9 @@
 // Runtime model configuration (populated from HuggingFace config.json)
 // ============================================================================
 
-typedef struct {
-    // Core architecture
-    int hidden_dim;
-    int num_layers;
-    int num_attn_heads;
-    int num_kv_heads;
-    int head_dim;
-    int vocab_size;
-    float rms_norm_eps;
+#include "infer_api.h"
 
-    // MoE
-    int num_experts;
-    int num_experts_per_tok;
-    int moe_intermediate;
-    int shared_intermediate;
-    int group_size;
-    int bits;
-
-    // Linear attention (GatedDeltaNet)
-    int linear_num_v_heads;
-    int linear_num_k_heads;
-    int linear_key_dim;
-    int linear_value_dim;
-    int conv_kernel_size;
-
-    // Full attention
-    float rope_theta;
-    float partial_rotary;
-
-    // Layer type map
-    int num_full_attn_layers;
-    int num_linear_layers;
-    bool *is_full_attn;       // [num_layers]
-    int *full_attn_index;     // [num_layers] — index into full-attn buffers, or -1
-    int *linear_index;        // [num_layers] — index into linear-attn buffers, or -1
-
-    // Derived: expert byte offsets (4-bit)
-    size_t expert_size_4bit;
-    size_t gate_w_off_4, gate_s_off_4, gate_b_off_4;
-    size_t up_w_off_4, up_s_off_4, up_b_off_4;
-    size_t down_w_off_4, down_s_off_4, down_b_off_4;
-
-    // Derived: expert byte offsets (2-bit)
-    size_t expert_size_2bit;
-    size_t gate_w_off_2, gate_s_off_2, gate_b_off_2;
-    size_t up_w_off_2, up_s_off_2, up_b_off_2;
-    size_t down_w_off_2, down_s_off_2, down_b_off_2;
-
-    // Derived dimensions
-    int linear_total_key;
-    int linear_total_value;
-    int linear_conv_dim;
-    int rotary_dim;
-
-    // Special tokens
-    int eos_token_ids[8];
-    int num_eos_tokens;
-    int think_start_token;
-    int think_end_token;
-
-    // Context limits
-    int max_seq_len;
-    int gpu_kv_seq;
-
-    // Model path (resolved)
-    char model_path[1024];
-} ModelConfig;
-
-static ModelConfig cfg;
+ModelConfig cfg;
 
 // ---- Tiered expert quantization manifest ----
 // Per-expert metadata: offset in layer file, size, and quant bits (2 or 4)
@@ -201,7 +135,7 @@ static void compute_expert_offsets(ModelConfig *c) {
     }
 }
 
-static void load_model_config(const char *model_dir) {
+void load_model_config(const char *model_dir) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.think_start_token = -1;
     cfg.think_end_token = -1;
@@ -380,7 +314,7 @@ static void load_model_config(const char *model_dir) {
 // Tiered manifest loader
 // ============================================================================
 
-static int load_tiered_manifest(const char *model_path) {
+int load_tiered_manifest(const char *model_path) {
     char manifest_path[1024];
     snprintf(manifest_path, sizeof(manifest_path),
              "%s/packed_experts_tiered/tiered_manifest.json", model_path);
@@ -500,7 +434,7 @@ static int GPU_KV_SEQ = 8192;
 #define PRED_COUNT(l)        g_pred_count[(l)]
 
 // Forward declaration — defined after LayerWeightCache and LZ4IndexEntry
-static void alloc_tracking_arrays(void);
+void alloc_tracking_arrays(void);
 
 
 // ============================================================================
@@ -571,6 +505,97 @@ static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_cache_io_split = 1;  // >1: split each routed expert pread into N page-aligned chunks (fanout)
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+
+// ---- Optimization flags (ported from develop branch) ----
+static int g_fused_expert_enabled = 0;   // 1: fused gate+up+SwiGLU kernel, 0: separate dispatches (default OFF until validated)
+static int g_cmd_merge_enabled = 1;      // 1: merge CMD1+CMD2 for linear attention (saves ~2ms/token), 0: separate
+static int g_fused_attention_enabled = 0; // 1: fused online softmax attention (experimental), 0: 3-kernel fallback
+static int g_use_fp16_accum = 0;         // 1: use half-precision accumulation in dequant kernels (experimental)
+static int g_use_fp8_kv = 0;            // 1: use FP8 E4M3 KV cache (4x memory reduction)
+static int g_sliding_window = 0;        // >0: sliding window size for full attention KV cache (circular buffer)
+static int g_h2o_budget = 0;            // 0 = disabled, >0 = total H2O KV cache budget (sinks + recent + heavy hitters)
+static int g_h2o_num_sinks = 4;         // attention sink tokens to keep (first N, typically 4)
+static int g_expert_prefetch_enabled = 0; // 1: cross-layer expert prefetch (overlaps I/O with GPU compute)
+static int *g_expert_prefetch_layer_fds = NULL; // [num_layers] fds for cross-layer prefetch (set by infer_init)
+static float g_merged_shared_gate_score = 0.0f; // CMD1+CMD2 merge: carries shared gate score across phases
+static int g_prefetch_hits_total = 0;    // expert prefetch diagnostic counters
+static int g_prefetch_misses_total = 0;
+
+// ---- FP8 E4M3 encode/decode (inline, for KV cache quantization) ----
+// FP8 E4M3 format: 1 sign bit, 4 exponent bits, 3 mantissa bits
+// Exponent bias: 7.  Range: [-448, 448].  NaN: 0x7F.
+
+static inline uint8_t fp8_e4m3_encode(float x, float inv_scale) {
+    float scaled = x * inv_scale;
+    if (scaled != scaled) return 0x7F;  // NaN -> FP8 NaN
+    scaled = fminf(fmaxf(scaled, -448.0f), 448.0f);
+
+    uint32_t bits;
+    memcpy(&bits, &scaled, sizeof(bits));
+    uint8_t sign = (bits >> 31) & 1;
+    float mag = fabsf(scaled);
+
+    if (mag < 0.001953125f) {
+        int m = (int)(mag / 0.001953125f + 0.5f);
+        if (m > 7) m = 7;
+        return (uint8_t)((sign << 7) | m);
+    }
+
+    int exp_unbiased = (int)floorf(log2f(mag));
+    if (exp_unbiased < -6) exp_unbiased = -6;
+    if (exp_unbiased > 8)  exp_unbiased = 8;
+
+    float frac = mag / powf(2.0f, (float)exp_unbiased) - 1.0f;
+    int mantissa = (int)(frac * 8.0f + 0.5f);
+    if (mantissa > 7) { mantissa = 0; exp_unbiased++; }
+
+    int exp_biased = exp_unbiased + 7;
+    if (exp_biased < 0) { exp_biased = 0; mantissa = 0; }
+    if (exp_biased > 15) { exp_biased = 15; mantissa = 6; }
+    if (exp_biased == 15 && mantissa >= 7) mantissa = 6;
+
+    return (uint8_t)((sign << 7) | (exp_biased << 3) | mantissa);
+}
+
+static inline float fp8_e4m3_decode(uint8_t x, float scale) {
+    if (x == 0x7F) return __builtin_nanf("");
+    uint8_t sign = (x >> 7) & 1;
+    uint8_t exp_biased = (x >> 3) & 0xF;
+    uint8_t mantissa = x & 0x7;
+    float val;
+    if (exp_biased == 0) {
+        val = (float)mantissa * 0.001953125f;
+    } else {
+        val = (1.0f + (float)mantissa / 8.0f) * powf(2.0f, (float)exp_biased - 7.0f);
+    }
+    if (sign) val = -val;
+    return val * scale;
+}
+
+static inline float fp8_absmax(const float *vec, int n) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(vec[i]);
+        if (a > amax) amax = a;
+    }
+    return amax;
+}
+
+static inline float fp8_encode_vec(const float *src, uint8_t *dst, int n) {
+    float amax = fp8_absmax(src, n);
+    float scale = (amax > 0.0f) ? (amax / 240.0f) : 1.0f;
+    float inv_scale = 1.0f / scale;
+    for (int i = 0; i < n; i++) {
+        dst[i] = fp8_e4m3_encode(src[i], inv_scale);
+    }
+    return scale;
+}
+
+static inline void fp8_decode_vec(const uint8_t *src, float *dst, int n, float scale) {
+    for (int i = 0; i < n; i++) {
+        dst[i] = fp8_e4m3_decode(src[i], scale);
+    }
+}
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [cfg.num_layers] cold fds (set in main)
@@ -897,13 +922,13 @@ static TensorInfo *find_tensor(TensorManifest *m, const char *name) {
 // Weight file: mmap'd binary blob
 // ============================================================================
 
-typedef struct {
+typedef struct WeightFile_s {
     void *data;
     size_t size;
     TensorManifest *manifest;
 } WeightFile;
 
-static WeightFile *open_weights(const char *bin_path, const char *json_path) {
+WeightFile *open_weights(const char *bin_path, const char *json_path) {
     // mmap the binary file
     int fd = open(bin_path, O_RDONLY);
     if (fd < 0) {
@@ -940,7 +965,7 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     return wf;
 }
 
-static void *get_tensor_ptr(WeightFile *wf, const char *name) {
+void *get_tensor_ptr(WeightFile *wf, const char *name) {
     TensorInfo *t = find_tensor(wf->manifest, name);
     if (!t) {
         fprintf(stderr, "WARNING: tensor '%s' not found\n", name);
@@ -957,43 +982,89 @@ static TensorInfo *get_tensor_info(WeightFile *wf, const char *name) {
 // Vocabulary for token decoding
 // ============================================================================
 
-typedef struct {
+typedef struct Vocabulary_s {
     char **tokens;   // token_id -> UTF-8 string
     int *lengths;    // token_id -> byte length
     int num_tokens;
 } Vocabulary;
 
 // GPT-2 BPE byte decoder: convert BPE Unicode chars back to raw bytes.
-// In GPT-2 BPE, bytes 0x00-0xFF are mapped to Unicode codepoints:
-//   printable ASCII (0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF) map to themselves
-//   everything else maps to U+0100 + offset (e.g., space 0x20 → U+0120 'Ġ')
-// This function decodes a UTF-8 BPE string back to raw bytes in-place.
+//
+// GPT-2 BPE maps each of the 256 possible byte values to a Unicode codepoint:
+//   printable ASCII (0x21-0x7E) → themselves (single-byte UTF-8, no conversion)
+//   high bytes (0xA1-0xAC, 0xAE-0xFF) → themselves as codepoints (2-byte UTF-8)
+//   all other bytes → U+0100 + sequential offset
+//
+// The vocab stores token strings using these codepoints (UTF-8 encoded).
+// This function reverses the mapping: decodes each codepoint back to its raw byte.
+//
+// Without this, non-ASCII text gets corrupted — e.g., Russian "Д" (UTF-8: 0xD0 0x94)
+// is stored as two BPE codepoints: U+00D0 (identity-mapped byte 0xD0) and U+0194
+// (remapped byte 0x94).  The decoder must emit raw bytes 0xD0 0x94, which together
+// form the correct UTF-8 for "Д".
+
+// Reverse lookup table: codepoint → original byte.  Built once, used by all decodes.
+static uint8_t g_bpe_cp_to_byte[512];
+static int     g_bpe_table_built = 0;
+
+static void bpe_build_decode_table(void) {
+    if (g_bpe_table_built) return;
+
+    // Mark all entries as "not a BPE codepoint" (0xFF is a valid byte, so we use
+    // a separate flag approach — but since every cp 0..511 maps to exactly one
+    // byte, we just fill the table the same way the encoder builds it).
+    memset(g_bpe_cp_to_byte, 0, sizeof(g_bpe_cp_to_byte));
+
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+        uint32_t cp;
+        if ((b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF))
+            cp = (uint32_t)b;        // identity-mapped
+        else
+            cp = 256 + (uint32_t)n++; // offset-mapped
+        if (cp < 512) g_bpe_cp_to_byte[cp] = (uint8_t)b;
+    }
+    g_bpe_table_built = 1;
+}
+
+// Check if a codepoint is part of the GPT-2 BPE byte mapping (cp < 512 and in range).
+static inline int bpe_is_mapped_cp(unsigned int cp) {
+    if (cp >= 0x21 && cp <= 0x7E) return 1;  // identity-mapped ASCII
+    if ((cp >= 0xA1 && cp <= 0xAC) || (cp >= 0xAE && cp <= 0xFF)) return 1;  // identity-mapped high
+    if (cp >= 0x100 && cp < 0x100 + 68) return 1;  // offset-mapped (68 non-identity bytes)
+    return 0;
+}
+
 static int bpe_decode_inplace(char *s, int len) {
+    bpe_build_decode_table();
+
     int out = 0;
     int i = 0;
     while (i < len) {
         unsigned char c = (unsigned char)s[i];
         if (c < 0x80) {
-            // ASCII byte — pass through
+            // 1-byte UTF-8 (ASCII).  Identity-mapped BPE codepoints (0x21-0x7E)
+            // decode to themselves, and anything outside that range (e.g. newline,
+            // space) shouldn't appear in raw BPE tokens.  Just pass through.
             s[out++] = s[i++];
         } else if ((c & 0xE0) == 0xC0 && i + 1 < len) {
-            // 2-byte UTF-8: U+0080 to U+07FF
+            // 2-byte UTF-8: codepoint U+0080 to U+07FF
             unsigned int cp = ((c & 0x1F) << 6) | ((unsigned char)s[i+1] & 0x3F);
-            if (cp >= 0x100 && cp <= 0x1FF) {
-                // GPT-2 BPE mapped byte: U+0100+byte → original byte
-                s[out++] = (char)(cp - 0x100);
+            if (bpe_is_mapped_cp(cp)) {
+                // GPT-2 BPE codepoint → emit the single raw byte it represents
+                s[out++] = (char)g_bpe_cp_to_byte[cp];
             } else {
-                // Regular Unicode char — keep UTF-8 encoding
+                // Not a BPE codepoint — keep the UTF-8 encoding as-is
                 s[out++] = s[i];
                 s[out++] = s[i+1];
             }
             i += 2;
         } else if ((c & 0xF0) == 0xE0 && i + 2 < len) {
-            // 3-byte UTF-8
+            // 3-byte UTF-8: these are never BPE byte codepoints — pass through
             s[out++] = s[i]; s[out++] = s[i+1]; s[out++] = s[i+2];
             i += 3;
         } else if ((c & 0xF8) == 0xF0 && i + 3 < len) {
-            // 4-byte UTF-8
+            // 4-byte UTF-8: pass through
             s[out++] = s[i]; s[out++] = s[i+1]; s[out++] = s[i+2]; s[out++] = s[i+3];
             i += 4;
         } else {
@@ -1004,7 +1075,7 @@ static int bpe_decode_inplace(char *s, int len) {
     return out;
 }
 
-static Vocabulary *load_vocab(const char *path) {
+Vocabulary *load_vocab(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "ERROR: Cannot open vocab %s\n", path);
@@ -1037,7 +1108,7 @@ static Vocabulary *load_vocab(const char *path) {
     return v;
 }
 
-static const char *decode_token(Vocabulary *v, int token_id) {
+const char *decode_token(Vocabulary *v, int token_id) {
     if (token_id < 0 || token_id >= v->num_tokens || !v->tokens[token_id]) {
         return "<unk>";
     }
@@ -1048,10 +1119,7 @@ static const char *decode_token(Vocabulary *v, int token_id) {
 // Prompt tokens loader
 // ============================================================================
 
-typedef struct {
-    uint32_t *ids;
-    int count;
-} PromptTokens;
+// PromptTokens defined in infer_api.h
 
 static PromptTokens *load_prompt_tokens(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -1076,11 +1144,17 @@ static int g_tokenizer_loaded = 0;
 
 static void init_tokenizer(void) {
     if (g_tokenizer_loaded) return;
-    const char *paths[] = {
-        "tokenizer.bin",
-        "metal_infer/tokenizer.bin",
-        NULL
-    };
+    // Try model_path first, then cwd, then metal_infer/
+    char model_tok[1024];
+    const char *paths[4];
+    int n = 0;
+    if (cfg.model_path[0]) {
+        snprintf(model_tok, sizeof(model_tok), "%s/tokenizer.bin", cfg.model_path);
+        paths[n++] = model_tok;
+    }
+    paths[n++] = "tokenizer.bin";
+    paths[n++] = "metal_infer/tokenizer.bin";
+    paths[n] = NULL;
     for (int i = 0; paths[i]; i++) {
         if (access(paths[i], R_OK) == 0) {
             if (bpe_load(&g_tokenizer, paths[i]) == 0) {
@@ -1113,7 +1187,7 @@ static void init_tokenizer(void) {
     fprintf(stderr, "WARNING: tokenizer.bin not found, tokenization will fail\n");
 }
 
-static PromptTokens *encode_prompt_text_to_tokens(const char *text) {
+PromptTokens *encode_prompt_text_to_tokens(const char *text) {
     init_tokenizer();
     if (!g_tokenizer_loaded) return NULL;
 
@@ -1183,7 +1257,7 @@ static void cpu_dequant_matvec(
 }
 
 // RMS normalization: out = x * w / rms(x)
-static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps) {
+void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps) {
     float sum_sq = 0.0f;
     for (int i = 0; i < dim; i++) {
         sum_sq += x[i] * x[i];
@@ -1288,7 +1362,7 @@ static void cpu_vec_zero(float *dst, int dim) {
 }
 
 // Argmax
-static int cpu_argmax(const float *x, int dim) {
+int cpu_argmax(const float *x, int dim) {
     int best = 0;
     float best_val = x[0];
     for (int i = 1; i < dim; i++) {
@@ -1358,11 +1432,24 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_apply_bf16;
     id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> swiglu;
+    id<MTLComputePipelineState> fused_gate_up;  // fused gate+up+SwiGLU kernel (4-bit only)
+    // FP16 accumulation variants (experimental — toggled via g_use_fp16_accum)
+    id<MTLComputePipelineState> matvec_v3_fp16;
+    id<MTLComputePipelineState> matvec_2bit_fp16;
+    id<MTLComputePipelineState> fused_gate_up_fp16;
     // GPU attention pipelines
     id<MTLComputePipelineState> attn_scores_pipe;
     id<MTLComputePipelineState> attn_softmax_pipe;
     id<MTLComputePipelineState> attn_values_pipe;
     id<MTLComputePipelineState> sigmoid_gate_pipe;
+    // FP8 E4M3 KV cache attention pipelines (opt-in via g_use_fp8_kv)
+    id<MTLComputePipelineState> attn_scores_fp8_pipe;
+    id<MTLComputePipelineState> attn_values_fp8_pipe;
+    // Fused online softmax attention (replaces 3-kernel pipeline)
+    id<MTLComputePipelineState> fused_attention_pipe;
+    id<MTLComputePipelineState> fused_attention_fp8_pipe;
+    // Function-constant specialized fused attention
+    id<MTLComputePipelineState> fused_attention_fc_pipe;
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [cfg.hidden_dim or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -1414,8 +1501,11 @@ typedef struct {
     id<MTLBuffer> buf_h_mid;        // [cfg.hidden_dim floats] residual+oproj result
     id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
     // GPU attention buffers (for full attention layers)
-    id<MTLBuffer> __strong *buf_kv_k;  // K cache per full-attn layer
-    id<MTLBuffer> __strong *buf_kv_v;  // V cache per full-attn layer
+    id<MTLBuffer> __strong *buf_kv_k;  // K cache per full-attn layer (float or uchar when FP8)
+    id<MTLBuffer> __strong *buf_kv_v;  // V cache per full-attn layer (float or uchar when FP8)
+    // FP8 per-position scale buffers (1 float per cached position per layer)
+    id<MTLBuffer> __strong *buf_kv_k_scales;  // [gpu_kv floats] per full-attn layer (FP8 only)
+    id<MTLBuffer> __strong *buf_kv_v_scales;  // [gpu_kv floats] per full-attn layer (FP8 only)
     id<MTLBuffer> buf_attn_q;       // [cfg.num_attn_heads * cfg.head_dim floats] all query heads
     id<MTLBuffer> buf_attn_scores;  // [cfg.num_attn_heads * cfg.max_seq_len floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [cfg.num_attn_heads * cfg.head_dim floats] full attention output
@@ -1430,6 +1520,7 @@ typedef struct {
     uint64_t event_value;                // monotonically increasing event counter
     // GPU delta-net (gated_delta_net_step) and conv1d pipelines
     id<MTLComputePipelineState> delta_net_step;  // gated_delta_net_step kernel
+    id<MTLComputePipelineState> delta_net_step_fused;  // pass 2+3 merged (saves ~1M reads/token)
     id<MTLComputePipelineState> conv1d_step;     // conv1d_step kernel
     id<MTLComputePipelineState> rms_norm_qk;     // per-head RMS normalize for q and k
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
@@ -1450,7 +1541,7 @@ typedef struct {
 
 static MetalCtx *g_metal = NULL;
 
-static MetalCtx *metal_setup(void) {
+MetalCtx *metal_setup(void) {
     // Set GPU KV cache size from model config (avoids over-allocating on iOS)
     if (cfg.max_seq_len > 0 && cfg.max_seq_len < GPU_KV_SEQ) {
         GPU_KV_SEQ = cfg.max_seq_len;
@@ -1461,6 +1552,8 @@ static MetalCtx *metal_setup(void) {
     // Allocate dynamic buffer arrays based on config
     ctx->buf_kv_k       = (__strong id<MTLBuffer> *)calloc(cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
     ctx->buf_kv_v       = (__strong id<MTLBuffer> *)calloc(cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
+    ctx->buf_kv_k_scales = (__strong id<MTLBuffer> *)calloc(cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
+    ctx->buf_kv_v_scales = (__strong id<MTLBuffer> *)calloc(cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
     ctx->buf_delta_state = (__strong id<MTLBuffer> *)calloc(cfg.num_linear_layers, sizeof(id<MTLBuffer>));
     ctx->buf_conv_state  = (__strong id<MTLBuffer> *)calloc(cfg.num_linear_layers, sizeof(id<MTLBuffer>));
     ctx->device = MTLCreateSystemDefaultDevice();
@@ -1528,17 +1621,57 @@ static MetalCtx *metal_setup(void) {
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
     ctx->residual_add  = makePipe(@"residual_add");
     ctx->swiglu        = makePipe(@"swiglu_fused");
+    ctx->fused_gate_up = makePipe(@"fused_gate_up_swiglu");
+    // FP16 accumulation variants (optional — float path is fallback)
+    ctx->matvec_v3_fp16    = makePipe(@"dequant_matvec_4bit_v3_fp16");
+    ctx->matvec_2bit_fp16  = makePipe(@"dequant_matvec_2bit_fp16");
+    ctx->fused_gate_up_fp16 = makePipe(@"fused_gate_up_swiglu_fp16");
+    if (!ctx->matvec_v3_fp16)    fprintf(stderr, "[metal] WARNING: fp16 matvec_v3 pipeline failed (float fallback)\n");
+    if (!ctx->matvec_2bit_fp16)  fprintf(stderr, "[metal] WARNING: fp16 matvec_2bit pipeline failed (float fallback)\n");
+    if (!ctx->fused_gate_up_fp16) fprintf(stderr, "[metal] WARNING: fp16 fused_gate_up pipeline failed (float fallback)\n");
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
+    // FP8 E4M3 KV cache attention kernels
+    ctx->attn_scores_fp8_pipe = makePipe(@"attn_scores_fp8");
+    ctx->attn_values_fp8_pipe = makePipe(@"attn_values_fp8");
+    // Fused online softmax attention (single kernel replaces 3-kernel pipeline)
+    ctx->fused_attention_pipe     = makePipe(@"fused_attention_online");
+    ctx->fused_attention_fp8_pipe = makePipe(@"fused_attention_online_fp8");
+    if (!ctx->fused_attention_pipe)     fprintf(stderr, "[metal] WARNING: fused_attention_online pipeline failed (3-kernel fallback)\n");
+    if (!ctx->fused_attention_fp8_pipe) fprintf(stderr, "[metal] WARNING: fused_attention_online_fp8 pipeline failed (3-kernel fallback)\n");
+    // Function-constant specialized fused attention
+    {
+        MTLFunctionConstantValues *fcv = [[MTLFunctionConstantValues alloc] init];
+        bool use_fp8 = (g_use_fp8_kv != 0);
+        [fcv setConstantValue:&use_fp8 type:MTLDataTypeBool atIndex:0];
+        NSError *fc_err = nil;
+        id<MTLFunction> fc_fn = [ctx->library newFunctionWithName:@"fused_attention_online_fc"
+                                                   constantValues:fcv
+                                                            error:&fc_err];
+        if (fc_fn) {
+            ctx->fused_attention_fc_pipe = [ctx->device newComputePipelineStateWithFunction:fc_fn error:&fc_err];
+            if (ctx->fused_attention_fc_pipe) {
+                printf("[metal] Function-constant fused attention pipeline ready (FP8=%d)\n", use_fp8);
+            } else {
+                fprintf(stderr, "[metal] WARNING: fused_attention_fc pipeline creation failed: %s\n",
+                        [[fc_err localizedDescription] UTF8String]);
+            }
+        } else {
+            fprintf(stderr, "[metal] WARNING: fused_attention_online_fc function not found: %s\n",
+                    fc_err ? [[fc_err localizedDescription] UTF8String] : "unknown");
+        }
+    }
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
+    ctx->delta_net_step_fused = makePipe(@"gated_delta_net_step_fused");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
     ctx->rms_norm_qk       = makePipe(@"rms_norm_qk");
     ctx->compute_decay_beta = makePipe(@"compute_decay_beta");
     ctx->gated_rms_norm    = makePipe(@"gated_rms_norm");
     if (!ctx->moe_combine_residual) fprintf(stderr, "[metal] WARNING: moe_combine_residual pipeline failed\n");
+    if (!ctx->delta_net_step_fused) fprintf(stderr, "[metal] WARNING: gated_delta_net_step_fused pipeline failed (using unfused fallback)\n");
     if (!ctx->delta_net_step) fprintf(stderr, "[metal] WARNING: gated_delta_net_step pipeline failed (CPU fallback)\n");
     if (!ctx->conv1d_step)    fprintf(stderr, "[metal] WARNING: conv1d_step pipeline failed (CPU fallback)\n");
     if (!ctx->rms_norm_qk)       fprintf(stderr, "[metal] WARNING: rms_norm_qk pipeline failed (CPU fallback)\n");
@@ -1648,12 +1781,23 @@ static MetalCtx *metal_setup(void) {
     // GPU attention buffers
     {
         size_t kv_dim = cfg.num_kv_heads * cfg.head_dim;  // 512
-        size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(float);
+        size_t kv_elem_size = g_use_fp8_kv ? sizeof(uint8_t) : sizeof(float);
+        size_t kv_cache_size = GPU_KV_SEQ * kv_dim * kv_elem_size;
         for (int i = 0; i < cfg.num_full_attn_layers; i++) {
             ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
             ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
+            if (g_use_fp8_kv) {
+                ctx->buf_kv_k_scales[i] = [ctx->device newBufferWithLength:GPU_KV_SEQ * sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+                ctx->buf_kv_v_scales[i] = [ctx->device newBufferWithLength:GPU_KV_SEQ * sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+            }
+        }
+        if (g_use_fp8_kv) {
+            printf("[metal] FP8 E4M3 KV cache enabled — 4x memory reduction (%.1f MB per layer)\n",
+                   kv_cache_size / 1e6);
         }
         ctx->buf_attn_q      = [ctx->device newBufferWithLength:cfg.num_attn_heads * cfg.head_dim * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
@@ -1704,7 +1848,7 @@ static MetalCtx *metal_setup(void) {
 }
 
 // Reset delta-net and conv GPU state buffers (call at start of new generation)
-static void reset_delta_net_state(void) {
+void reset_delta_net_state(void) {
     if (!g_metal || !g_metal->delta_net_step) return;
     for (int i = 0; i < cfg.num_linear_layers; i++) {
         if (g_metal->buf_delta_state[i])
@@ -1716,9 +1860,11 @@ static void reset_delta_net_state(void) {
 
 // Wrap the mmap'd weight file as Metal buffer(s) (zero-copy on unified memory).
 // Metal enforces a hard 4GB per-buffer limit. Files >4GB get two overlapping buffers.
+// mmap returns page-aligned addresses, Metal requires the same.
+// On Apple Silicon, page size is 16KB.
 #define METAL_MAX_BUF ((size_t)4096 * 1024 * 1024 - 16384)  // 4GB - 1 page
 #define WF_STAGING_SIZE ((size_t)50 * 1024 * 1024)  // legacy, kept for compile compat
-static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
+void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
     size_t page_size = 16384;
     ctx->wf_mmap_base = data;
     ctx->wf_mmap_size = size;
@@ -1878,7 +2024,15 @@ static void gpu_dequant_matvec(
     // v3 shader uses x_shared[4096], so can only handle in_dim <= 4096
     // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
     int use_v3 = (in_dim <= 4096);
-    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+    {
+        id<MTLComputePipelineState> pipe;
+        if (g_use_fp16_accum && use_v3 && ctx->matvec_v3_fp16) {
+            pipe = ctx->matvec_v3_fp16;
+        } else {
+            pipe = use_v3 ? ctx->matvec_v3 : ctx->matvec_fast;
+        }
+        [enc setComputePipelineState:pipe];
+    }
     [enc setBuffer:w_buf        offset:w_off atIndex:0];
     [enc setBuffer:s_buf        offset:s_off atIndex:1];
     [enc setBuffer:b_buf        offset:b_off atIndex:2];
@@ -1979,7 +2133,15 @@ static void gpu_batch_matvec(
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+        {
+            id<MTLComputePipelineState> pipe;
+            if (g_use_fp16_accum && use_v3 && ctx->matvec_v3_fp16) {
+                pipe = ctx->matvec_v3_fp16;
+            } else {
+                pipe = use_v3 ? ctx->matvec_v3 : ctx->matvec_fast;
+            }
+            [enc setComputePipelineState:pipe];
+        }
         [enc setBuffer:w_buf        offset:w_off atIndex:0];
         [enc setBuffer:s_buf        offset:s_off atIndex:1];
         [enc setBuffer:b_buf        offset:b_off atIndex:2];
@@ -2042,7 +2204,15 @@ static void gpu_encode_batch_matvec(
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+        {
+            id<MTLComputePipelineState> pipe;
+            if (g_use_fp16_accum && use_v3 && ctx->matvec_v3_fp16) {
+                pipe = ctx->matvec_v3_fp16;
+            } else {
+                pipe = use_v3 ? ctx->matvec_v3 : ctx->matvec_fast;
+            }
+            [enc setComputePipelineState:pipe];
+        }
         [enc setBuffer:w_buf        offset:w_off atIndex:0];
         [enc setBuffer:s_buf        offset:s_off atIndex:1];
         [enc setBuffer:b_buf        offset:b_off atIndex:2];
@@ -2096,7 +2266,15 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
 
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
     int use_v3 = (in_dim <= 4096);
-    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+    {
+        id<MTLComputePipelineState> pipe;
+        if (g_use_fp16_accum && use_v3 && ctx->matvec_v3_fp16) {
+            pipe = ctx->matvec_v3_fp16;
+        } else {
+            pipe = use_v3 ? ctx->matvec_v3 : ctx->matvec_fast;
+        }
+        [enc setComputePipelineState:pipe];
+    }
     [enc setBuffer:w_buf offset:w_off atIndex:0];
     [enc setBuffer:s_buf offset:s_off atIndex:1];
     [enc setBuffer:b_buf offset:b_off atIndex:2];
@@ -2356,52 +2534,97 @@ static void gpu_encode_experts_batched(
             gate_w_off = cfg.gate_w_off_2; gate_s_off = cfg.gate_s_off_2; gate_b_off = cfg.gate_b_off_2;
             up_w_off   = cfg.up_w_off_2;   up_s_off   = cfg.up_s_off_2;   up_b_off   = cfg.up_b_off_2;
             down_w_off = cfg.down_w_off_2; down_s_off = cfg.down_s_off_2; down_b_off = cfg.down_b_off_2;
-            expert_pipe = ctx->matvec_2bit;
+            expert_pipe = (g_use_fp16_accum && ctx->matvec_2bit_fp16) ? ctx->matvec_2bit_fp16 : ctx->matvec_2bit;
         } else {
             gate_w_off = cfg.gate_w_off_4; gate_s_off = cfg.gate_s_off_4; gate_b_off = cfg.gate_b_off_4;
             up_w_off   = cfg.up_w_off_4;   up_s_off   = cfg.up_s_off_4;   up_b_off   = cfg.up_b_off_4;
             down_w_off = cfg.down_w_off_4; down_s_off = cfg.down_s_off_4; down_b_off = cfg.down_b_off_4;
-            expert_pipe = ctx->matvec_v3;
+            expert_pipe = (g_use_fp16_accum && ctx->matvec_v3_fp16) ? ctx->matvec_v3_fp16 : ctx->matvec_v3;
         }
 
-        // Encoder A: gate_proj + up_proj (both read same input, write different outputs)
-        {
-            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            // gate_proj
-            [enc setComputePipelineState:expert_pipe];
-            [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
-            [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
-            [enc setBuffer:expert_bufs[k]                  offset:gate_b_off  atIndex:2];
-            [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:3];
-            [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0           atIndex:4];
-            [enc setBytes:&gate_up_out length:4 atIndex:5];
-            [enc setBytes:&gate_up_in  length:4 atIndex:6];
-            [enc setBytes:&gs          length:4 atIndex:7];
-            [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            // up_proj (same encoder, serialized after gate — shares encoder overhead)
-            [enc setBuffer:expert_bufs[k]                  offset:up_w_off  atIndex:0];
-            [enc setBuffer:expert_bufs[k]                  offset:up_s_off  atIndex:1];
-            [enc setBuffer:expert_bufs[k]                  offset:up_b_off  atIndex:2];
-            [enc setBuffer:ctx->buf_multi_expert_up[k]     offset:0          atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        }
+        // 4-bit path: fused gate+up+SwiGLU kernel (1 dispatch instead of 3)
+        // 2-bit path: fallback to separate gate, up, SwiGLU dispatches
+        if (!use_2bit_k && g_fused_expert_enabled && ctx->fused_gate_up) {
+            // Encoder A: fused_gate_up_swiglu -> act[k] directly
+            // NOTE: fused kernel uses 1 TG per output row (like matvec_fast),
+            // NOT ROWS_PER_TG=8 rows per threadgroup (like matvec_v3).
+            {
+                id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                id<MTLComputePipelineState> fused_pipe = (g_use_fp16_accum && ctx->fused_gate_up_fp16)
+                    ? ctx->fused_gate_up_fp16 : ctx->fused_gate_up;
+                [enc setComputePipelineState:fused_pipe];
+                [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
+                [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
+                [enc setBuffer:expert_bufs[k]                  offset:gate_b_off  atIndex:2];
+                [enc setBuffer:expert_bufs[k]                  offset:up_w_off    atIndex:3];
+                [enc setBuffer:expert_bufs[k]                  offset:up_s_off    atIndex:4];
+                [enc setBuffer:expert_bufs[k]                  offset:up_b_off    atIndex:5];
+                [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:6];
+                [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:7];
+                [enc setBytes:&gate_up_out length:4 atIndex:8];
+                [enc setBytes:&gate_up_in  length:4 atIndex:9];
+                [enc setBytes:&gs          length:4 atIndex:10];
+                [enc dispatchThreadgroups:MTLSizeMake(gate_up_out, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
 
-        // Encoder B: SwiGLU + down_proj (SwiGLU depends on gate+up from Enc A)
-        {
-            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            // SwiGLU
-            [enc setComputePipelineState:ctx->swiglu];
-            [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_multi_expert_up[k]   offset:0 atIndex:1];
-            [enc setBuffer:ctx->buf_multi_expert_act[k]  offset:0 atIndex:2];
-            [enc setBytes:&gate_up_out length:4 atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            // down_proj (same encoder, serialized after SwiGLU)
-            [enc setComputePipelineState:expert_pipe];
+            // Encoder B: down_proj only (reads from act[k])
+            {
+                id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                [enc setComputePipelineState:expert_pipe];
+                [enc setBuffer:expert_bufs[k]                  offset:down_w_off  atIndex:0];
+                [enc setBuffer:expert_bufs[k]                  offset:down_s_off  atIndex:1];
+                [enc setBuffer:expert_bufs[k]                  offset:down_b_off  atIndex:2];
+                [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:3];
+                [enc setBuffer:ctx->buf_multi_expert_out[k]    offset:0           atIndex:4];
+                [enc setBytes:&down_out length:4 atIndex:5];
+                [enc setBytes:&down_in  length:4 atIndex:6];
+                [enc setBytes:&gs       length:4 atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(down_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+        } else {
+            // Fallback: separate gate + up + SwiGLU (for 2-bit or if fused pipeline unavailable)
+            // Encoder A: gate_proj + up_proj (both read same input, write different outputs)
+            {
+                id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                // gate_proj
+                [enc setComputePipelineState:expert_pipe];
+                [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
+                [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
+                [enc setBuffer:expert_bufs[k]                  offset:gate_b_off  atIndex:2];
+                [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:3];
+                [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0           atIndex:4];
+                [enc setBytes:&gate_up_out length:4 atIndex:5];
+                [enc setBytes:&gate_up_in  length:4 atIndex:6];
+                [enc setBytes:&gs          length:4 atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                // up_proj (same encoder, serialized after gate — shares encoder overhead)
+                [enc setBuffer:expert_bufs[k]                  offset:up_w_off  atIndex:0];
+                [enc setBuffer:expert_bufs[k]                  offset:up_s_off  atIndex:1];
+                [enc setBuffer:expert_bufs[k]                  offset:up_b_off  atIndex:2];
+                [enc setBuffer:ctx->buf_multi_expert_up[k]     offset:0          atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+
+            // Encoder B: SwiGLU + down_proj (SwiGLU depends on gate+up from Enc A)
+            {
+                id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                // SwiGLU
+                [enc setComputePipelineState:ctx->swiglu];
+                [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
+                [enc setBuffer:ctx->buf_multi_expert_up[k]   offset:0 atIndex:1];
+                [enc setBuffer:ctx->buf_multi_expert_act[k]  offset:0 atIndex:2];
+                [enc setBytes:&gate_up_out length:4 atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                // down_proj (same encoder, serialized after SwiGLU)
+                [enc setComputePipelineState:expert_pipe];
             [enc setBuffer:expert_bufs[k]                  offset:down_w_off  atIndex:0];
             [enc setBuffer:expert_bufs[k]                  offset:down_s_off  atIndex:1];
             [enc setBuffer:expert_bufs[k]                  offset:down_b_off  atIndex:2];
@@ -2413,6 +2636,7 @@ static void gpu_encode_experts_batched(
             [enc dispatchThreadgroups:MTLSizeMake(down_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
+            }
         }
     }
 }
@@ -2694,17 +2918,99 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
 // KV Cache for full attention layers
 // ============================================================================
 
-typedef struct {
-    float *k_cache;  // [max_seq, num_kv_heads * head_dim]
-    float *v_cache;  // [max_seq, num_kv_heads * head_dim]
-    int len;         // current number of cached entries
+typedef struct KVCache_s {
+    float *k_cache;      // [capacity, num_kv_heads * head_dim] (NULL when use_fp8=1)
+    float *v_cache;      // [capacity, num_kv_heads * head_dim] (NULL when use_fp8=1)
+    uint8_t *k_cache_fp8;  // [capacity, num_kv_heads * head_dim] FP8 E4M3 (NULL when use_fp8=0)
+    uint8_t *v_cache_fp8;  // [capacity, num_kv_heads * head_dim] FP8 E4M3 (NULL when use_fp8=0)
+    float *k_scales;     // [capacity] per-position K scale (FP8 only)
+    float *v_scales;     // [capacity] per-position V scale (FP8 only)
+    int len;             // total tokens written (monotonically increasing)
+    int use_fp8;         // 1 = FP8 E4M3, 0 = float32
+    int window_size;     // >0: sliding window (circular buffer), 0: unlimited
+    int capacity;        // allocated size (= window_size if sliding, else max_seq)
+    // H2O (Heavy Hitter Oracle) eviction state
+    float *attn_scores_accum;  // [capacity] cumulative attention score per position
+    int *token_positions;      // [capacity] original sequence position (for sink detection)
+    int h2o_budget;           // total positions to keep (sinks + recent + heavy hitters)
+    int h2o_num_sinks;        // number of sink tokens (first N, typically 4)
+    int h2o_num_recent;       // number of recent tokens to always keep
+    int h2o_active;           // 1 = H2O eviction enabled
+    int h2o_num_valid;        // current number of valid positions in cache
+    int *h2o_valid_indices;   // [capacity] indices of valid positions in contiguous order
 } KVCache;
 
-static KVCache *kv_cache_new(void) {
+KVCache *kv_cache_new(void) {
+    int max_seq = cfg.gpu_kv_seq > 0 ? cfg.gpu_kv_seq : cfg.max_seq_len;
     KVCache *c = calloc(1, sizeof(KVCache));
-    c->k_cache = calloc(cfg.max_seq_len * cfg.num_kv_heads * cfg.head_dim, sizeof(float));
-    c->v_cache = calloc(cfg.max_seq_len * cfg.num_kv_heads * cfg.head_dim, sizeof(float));
     c->len = 0;
+    c->use_fp8 = g_use_fp8_kv;
+    // H2O replaces sliding window when both are set (H2O is strictly better)
+    if (g_h2o_budget > 0) {
+        c->window_size = 0;  // disable sliding window — H2O handles eviction
+    } else {
+        c->window_size = g_sliding_window;  // 0 = unlimited, >0 = circular buffer
+    }
+    // Capacity: if sliding window, only allocate window_size positions
+    // For H2O: allocate full budget (we compact in-place, never exceed budget+1)
+    int seq;
+    if (g_h2o_budget > 0) {
+        seq = (g_h2o_budget + 1 < max_seq) ? g_h2o_budget + 1 : max_seq;
+    } else if (c->window_size > 0 && c->window_size < max_seq) {
+        seq = c->window_size;
+    } else {
+        seq = max_seq;
+    }
+    c->capacity = seq;
+    size_t kv_dim = (size_t)cfg.num_kv_heads * cfg.head_dim;
+
+    if (c->use_fp8) {
+        c->k_cache_fp8 = calloc((size_t)seq * kv_dim, sizeof(uint8_t));
+        c->v_cache_fp8 = calloc((size_t)seq * kv_dim, sizeof(uint8_t));
+        c->k_scales = calloc(seq, sizeof(float));
+        c->v_scales = calloc(seq, sizeof(float));
+        c->k_cache = NULL;
+        c->v_cache = NULL;
+        if (!c->k_cache_fp8 || !c->v_cache_fp8 || !c->k_scales || !c->v_scales) {
+            fprintf(stderr, "ERROR: FP8 KV cache alloc failed (seq=%d, %.1f MB each)\n",
+                    seq, (double)seq * kv_dim * sizeof(uint8_t) / 1e6);
+            free(c->k_cache_fp8); free(c->v_cache_fp8);
+            free(c->k_scales); free(c->v_scales); free(c);
+            return NULL;
+        }
+    } else {
+        c->k_cache = calloc((size_t)seq * kv_dim, sizeof(float));
+        c->v_cache = calloc((size_t)seq * kv_dim, sizeof(float));
+        c->k_cache_fp8 = NULL; c->v_cache_fp8 = NULL;
+        c->k_scales = NULL; c->v_scales = NULL;
+        if (!c->k_cache || !c->v_cache) {
+            fprintf(stderr, "ERROR: KV cache alloc failed (seq=%d, %.1f MB each)\n",
+                    seq, (double)seq * kv_dim * sizeof(float) / 1e6);
+            free(c->k_cache); free(c->v_cache); free(c);
+            return NULL;
+        }
+    }
+    // H2O initialization
+    c->h2o_active = (g_h2o_budget > 0) ? 1 : 0;
+    c->h2o_budget = g_h2o_budget;
+    c->h2o_num_sinks = g_h2o_num_sinks;
+    c->h2o_num_recent = c->h2o_active ? (c->h2o_budget - c->h2o_num_sinks) / 4 : 0;
+    c->h2o_num_valid = 0;
+    if (c->h2o_active) {
+        c->attn_scores_accum = calloc(seq, sizeof(float));
+        c->token_positions = calloc(seq, sizeof(int));
+        c->h2o_valid_indices = calloc(seq, sizeof(int));
+        if (!c->attn_scores_accum || !c->token_positions || !c->h2o_valid_indices) {
+            fprintf(stderr, "ERROR: H2O alloc failed (seq=%d)\n", seq);
+            free(c->attn_scores_accum); free(c->token_positions);
+            free(c->h2o_valid_indices);
+            c->h2o_active = 0;
+        }
+    } else {
+        c->attn_scores_accum = NULL;
+        c->token_positions = NULL;
+        c->h2o_valid_indices = NULL;
+    }
     return c;
 }
 
@@ -2712,7 +3018,107 @@ static void kv_cache_free(KVCache *c) {
     if (c) {
         free(c->k_cache);
         free(c->v_cache);
+        free(c->k_cache_fp8);
+        free(c->v_cache_fp8);
+        free(c->k_scales);
+        free(c->v_scales);
+        free(c->attn_scores_accum);
+        free(c->token_positions);
+        free(c->h2o_valid_indices);
         free(c);
+    }
+}
+
+// ---- H2O (Heavy Hitter Oracle) KV cache eviction ----
+// Evicts positions from the KV cache to keep at most h2o_budget entries.
+// Protection categories: attention sinks (first N), recent tokens, heavy hitters.
+// Called after each new KV write when H2O is active and num_valid exceeds budget.
+static void kv_cache_evict_h2o(KVCache *kv) {
+    if (!kv->h2o_active || kv->h2o_num_valid <= kv->h2o_budget) return;
+
+    int budget = kv->h2o_budget;
+    int num_sinks = kv->h2o_num_sinks;
+    int num_recent = kv->h2o_num_recent;
+    int num_valid = kv->h2o_num_valid;
+    int kv_dim = cfg.num_kv_heads * cfg.head_dim;
+
+    // Mark positions to keep: sinks + recent + heavy hitters
+    int *keep = calloc(num_valid, sizeof(int));
+
+    // 1. Always keep sink tokens (first num_sinks original positions)
+    int kept = 0;
+    for (int i = 0; i < num_valid && kept < num_sinks; i++) {
+        if (kv->token_positions[i] < num_sinks) {
+            keep[i] = 1;
+            kept++;
+        }
+    }
+
+    // 2. Always keep recent tokens (last num_recent written)
+    for (int i = num_valid - num_recent; i < num_valid; i++) {
+        if (i >= 0 && !keep[i]) {
+            keep[i] = 1;
+            kept++;
+        }
+    }
+
+    // 3. Fill remaining budget with highest attention scores (heavy hitters)
+    int hh_budget = budget - kept;
+    if (hh_budget > 0) {
+        // Find indices of non-kept positions sorted by score (simple selection)
+        for (int h = 0; h < hh_budget; h++) {
+            int best = -1;
+            float best_score = -1e30f;
+            for (int i = 0; i < num_valid; i++) {
+                if (!keep[i] && kv->attn_scores_accum[i] > best_score) {
+                    best_score = kv->attn_scores_accum[i];
+                    best = i;
+                }
+            }
+            if (best >= 0) {
+                keep[best] = 1;
+                kept++;
+            }
+        }
+    }
+
+    // Compact: move kept positions to front
+    int write_pos = 0;
+    for (int i = 0; i < num_valid; i++) {
+        if (!keep[i]) continue;
+        if (write_pos != i) {
+            if (kv->use_fp8) {
+                memcpy(kv->k_cache_fp8 + write_pos * kv_dim, kv->k_cache_fp8 + i * kv_dim, kv_dim);
+                memcpy(kv->v_cache_fp8 + write_pos * kv_dim, kv->v_cache_fp8 + i * kv_dim, kv_dim);
+                kv->k_scales[write_pos] = kv->k_scales[i];
+                kv->v_scales[write_pos] = kv->v_scales[i];
+            } else {
+                memcpy(kv->k_cache + write_pos * kv_dim, kv->k_cache + i * kv_dim, kv_dim * sizeof(float));
+                memcpy(kv->v_cache + write_pos * kv_dim, kv->v_cache + i * kv_dim, kv_dim * sizeof(float));
+            }
+            kv->attn_scores_accum[write_pos] = kv->attn_scores_accum[i];
+            kv->token_positions[write_pos] = kv->token_positions[i];
+        }
+        write_pos++;
+    }
+    kv->h2o_num_valid = write_pos;
+    free(keep);
+}
+
+// Sync GPU KV buffers after H2O compaction (re-upload compacted data)
+static void kv_cache_h2o_sync_gpu(KVCache *kv, int fa_idx) {
+    if (!kv->h2o_active || !g_metal || fa_idx < 0) return;
+    int kv_dim = cfg.num_kv_heads * cfg.head_dim;
+    int num_valid = kv->h2o_num_valid;
+
+    if (g_use_fp8_kv && g_metal->buf_kv_k_scales && g_metal->buf_kv_k_scales[fa_idx]) {
+        memcpy([g_metal->buf_kv_k[fa_idx] contents], kv->k_cache_fp8, (size_t)num_valid * kv_dim);
+        memcpy([g_metal->buf_kv_v[fa_idx] contents], kv->v_cache_fp8, (size_t)num_valid * kv_dim);
+        memcpy([g_metal->buf_kv_k_scales[fa_idx] contents], kv->k_scales, num_valid * sizeof(float));
+        memcpy([g_metal->buf_kv_v_scales[fa_idx] contents], kv->v_scales, num_valid * sizeof(float));
+    } else if (g_metal->buf_kv_k && g_metal->buf_kv_k[fa_idx]) {
+        memcpy([g_metal->buf_kv_k[fa_idx] contents], kv->k_cache, (size_t)num_valid * kv_dim * sizeof(float));
+        memcpy([g_metal->buf_kv_v[fa_idx] contents], kv->v_cache, (size_t)num_valid * kv_dim * sizeof(float));
     }
 }
 
@@ -2720,12 +3126,12 @@ static void kv_cache_free(KVCache *c) {
 // Linear attention state (GatedDeltaNet recurrent state)
 // ============================================================================
 
-typedef struct {
+typedef struct LinearAttnState_s {
     float *conv_state;  // [(kernel_size-1) * conv_dim] for conv1d
     float *ssm_state;   // [num_v_heads, head_v_dim, head_k_dim] recurrent state
 } LinearAttnState;
 
-static LinearAttnState *linear_attn_state_new(void) {
+LinearAttnState *linear_attn_state_new(void) {
     LinearAttnState *s = calloc(1, sizeof(LinearAttnState));
     s->conv_state = calloc((cfg.conv_kernel_size - 1) * cfg.linear_conv_dim, sizeof(float));
     s->ssm_state = calloc(cfg.linear_num_v_heads * cfg.linear_value_dim * cfg.linear_key_dim, sizeof(float));
@@ -2889,10 +3295,39 @@ static void full_attention_forward(
     // ---- RoPE ----
     apply_rotary_emb(q, k, pos, cfg.num_attn_heads, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim);
 
-    // ---- Update KV cache ----
-    int cache_pos = kv->len;
-    memcpy(kv->k_cache + cache_pos * kv_dim, k, kv_dim * sizeof(float));
-    memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
+    // ---- Update KV cache (circular buffer for sliding window, or H2O) ----
+    int cache_pos;
+    if (kv->h2o_active) {
+        cache_pos = kv->h2o_num_valid;
+        if (cache_pos >= kv->capacity) {
+            fprintf(stderr, "ERROR: H2O KV cache overflow (pos=%d >= cap=%d)\n", cache_pos, kv->capacity);
+            free(normed); free(residual); free(q); free(q_gate); free(k); free(v);
+            return;
+        }
+    } else if (kv->window_size > 0) {
+        cache_pos = kv->len % kv->capacity;  // circular write
+    } else {
+        cache_pos = kv->len;
+        if (cache_pos >= kv->capacity) {
+            fprintf(stderr, "ERROR: KV cache overflow (pos=%d >= cap=%d)\n", cache_pos, kv->capacity);
+            free(normed); free(residual); free(q); free(q_gate); free(k); free(v);
+            return;
+        }
+    }
+    if (kv->use_fp8) {
+        if (kv->k_cache_fp8 && kv->v_cache_fp8) {
+            kv->k_scales[cache_pos] = fp8_encode_vec(k, kv->k_cache_fp8 + cache_pos * kv_dim, kv_dim);
+            kv->v_scales[cache_pos] = fp8_encode_vec(v, kv->v_cache_fp8 + cache_pos * kv_dim, kv_dim);
+        }
+    } else {
+        memcpy(kv->k_cache + cache_pos * kv_dim, k, kv_dim * sizeof(float));
+        memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
+    }
+    if (kv->h2o_active) {
+        kv->token_positions[cache_pos] = kv->len;
+        kv->attn_scores_accum[cache_pos] = 0.0f;
+        kv->h2o_num_valid++;
+    }
     kv->len++;
 
     // ---- Scaled dot-product attention ----
@@ -2903,34 +3338,85 @@ static void full_attention_forward(
 
     float *attn_out = calloc(q_dim, sizeof(float));
 
+    // Temp buffer for dequantized K/V when using FP8
+    float *k_dequant = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
+    float *v_dequant = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
+
+    // Determine attention range
+    int attn_len;
+    if (kv->h2o_active) {
+        attn_len = kv->h2o_num_valid;
+    } else if (kv->window_size > 0 && kv->len > kv->window_size) {
+        attn_len = kv->window_size;
+    } else {
+        attn_len = kv->len;
+    }
+
+    // H2O score accumulator for this step
+    float *h2o_step_scores = kv->h2o_active ? calloc(attn_len, sizeof(float)) : NULL;
+
     for (int h = 0; h < cfg.num_attn_heads; h++) {
         int kv_h = h / heads_per_kv;
         float *qh = q + h * cfg.head_dim;
 
-        // Compute attention scores for all cached positions
-        float *scores = malloc(kv->len * sizeof(float));
-        for (int p = 0; p < kv->len; p++) {
-            float *kp = kv->k_cache + p * kv_dim + kv_h * cfg.head_dim;
-            float dot = 0.0f;
-            for (int d = 0; d < cfg.head_dim; d++) {
-                dot += qh[d] * kp[d];
+        float *scores = malloc(attn_len * sizeof(float));
+        if (!scores) {
+            fprintf(stderr, "ERROR: attention scores alloc failed (len=%d)\n", attn_len);
+            continue;
+        }
+        for (int i = 0; i < attn_len; i++) {
+            int p;
+            if (!kv->h2o_active && kv->window_size > 0 && kv->len > kv->window_size) {
+                p = (kv->len - kv->window_size + i) % kv->capacity;
+            } else {
+                p = i;
             }
-            scores[p] = dot * scale;
+            float dot = 0.0f;
+            if (kv->use_fp8) {
+                fp8_decode_vec(kv->k_cache_fp8 + p * kv_dim, k_dequant, kv_dim, kv->k_scales[p]);
+                float *kp = k_dequant + kv_h * cfg.head_dim;
+                for (int d = 0; d < cfg.head_dim; d++) dot += qh[d] * kp[d];
+            } else {
+                float *kp = kv->k_cache + p * kv_dim + kv_h * cfg.head_dim;
+                for (int d = 0; d < cfg.head_dim; d++) dot += qh[d] * kp[d];
+            }
+            scores[i] = dot * scale;
         }
 
-        // Softmax
-        cpu_softmax(scores, kv->len);
+        cpu_softmax(scores, attn_len);
 
-        // Weighted sum of values
+        // Accumulate softmax scores for H2O
+        if (h2o_step_scores) {
+            for (int i = 0; i < attn_len; i++) h2o_step_scores[i] += scores[i];
+        }
+
         float *oh = attn_out + h * cfg.head_dim;
-        for (int p = 0; p < kv->len; p++) {
-            float *vp = kv->v_cache + p * kv_dim + kv_h * cfg.head_dim;
-            for (int d = 0; d < cfg.head_dim; d++) {
-                oh[d] += scores[p] * vp[d];
+        for (int i = 0; i < attn_len; i++) {
+            int p;
+            if (!kv->h2o_active && kv->window_size > 0 && kv->len > kv->window_size) {
+                p = (kv->len - kv->window_size + i) % kv->capacity;
+            } else {
+                p = i;
+            }
+            if (kv->use_fp8) {
+                fp8_decode_vec(kv->v_cache_fp8 + p * kv_dim, v_dequant, kv_dim, kv->v_scales[p]);
+                float *vp = v_dequant + kv_h * cfg.head_dim;
+                for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[i] * vp[d];
+            } else {
+                float *vp = kv->v_cache + p * kv_dim + kv_h * cfg.head_dim;
+                for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[i] * vp[d];
             }
         }
         free(scores);
     }
+    // Update H2O cumulative scores and run eviction
+    if (h2o_step_scores) {
+        for (int i = 0; i < attn_len; i++) kv->attn_scores_accum[i] += h2o_step_scores[i];
+        free(h2o_step_scores);
+        kv_cache_evict_h2o(kv);
+    }
+    free(k_dequant);
+    free(v_dequant);
 
 
     // ---- Apply sigmoid gate to attention output ----
@@ -3492,7 +3978,7 @@ static void moe_forward(
 // Embedding lookup (4-bit quantized)
 // ============================================================================
 
-static void embed_lookup(WeightFile *wf, int token_id, float *out) {
+void embed_lookup(WeightFile *wf, int token_id, float *out) {
     // Embedding: weight[vocab_size, hidden_dim/8] (U32), scales[vocab_size, groups], biases[vocab_size, groups]
     // For embedding lookup, we just need one row.
     // But the embedding is quantized: each row has hidden_dim/8 uint32 values (packed 4-bit)
@@ -3543,7 +4029,7 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
 // LM head (logits projection)
 // ============================================================================
 
-static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) {
+void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) {
     // lm_head: [hidden_dim=4096] -> [vocab_size=248320]
     // This is a HUGE matmul. For 248320 output dims, it will be slow on CPU.
     // Optimization: only compute top candidates
@@ -3663,7 +4149,7 @@ static void *io_pool_worker(void *arg) {
     return NULL;
 }
 
-static void io_pool_init(void) {
+void io_pool_init(void) {
     if (g_io_pool_initialized) return;
     pthread_mutex_init(&g_io_pool.mutex, NULL);
     pthread_cond_init(&g_io_pool.work_ready, NULL);
@@ -4031,6 +4517,7 @@ static void expert_cache_free(ExpertLRUCache *cache) {
            (cache->hits + cache->misses) > 0
                ? 100.0 * cache->hits / (cache->hits + cache->misses) : 0.0);
     // Metal buffers released by ARC when entries are freed
+    free(cache->entry_idx);
     free(cache->entries);
     free(cache);
 }
@@ -4249,6 +4736,7 @@ static void malloc_cache_free(MallocExpertCache *cache) {
     }
     free(cache->data);
     free(cache->metal_bufs);
+    free(cache->entry_idx);
     free(cache->layer_idx);
     free(cache->expert_idx);
     free(cache->last_used);
@@ -4429,7 +4917,7 @@ static LayerWeightCache *layer_cache = NULL;
 static int layer_cache_built = 0;
 
 // Allocate all dynamic tracking arrays (must be called after load_model_config)
-static void alloc_tracking_arrays(void) {
+void alloc_tracking_arrays(void) {
     int nl = cfg.num_layers;
     int ne = cfg.num_experts;
     int seen_bytes_per_layer = (ne + 7) / 8;
@@ -4646,7 +5134,7 @@ static void finalize_deferred_experts(void) {
 
 // Complete the deferred GPU expert compute: wait for GPU, read back, accumulate, combine.
 // Must be called before the next layer modifies static scratch buffers.
-static void complete_deferred_experts(void) {
+void complete_deferred_experts(void) {
     wait_deferred_experts_gpu();
     finalize_deferred_experts();
 }
@@ -4655,7 +5143,7 @@ static void complete_deferred_experts(void) {
 // but skip the CPU readback/combine. Used during prefill for intermediate tokens
 // where the hidden state will be immediately overwritten by the next token's embedding.
 // This saves ~0.1-0.2ms per prefill token (avoids unnecessary memcpy + combine work).
-static void discard_deferred_experts(void) {
+void discard_deferred_experts(void) {
     wait_deferred_experts_gpu();
     // Clear deferred state without reading back results
     if (g_deferred.active) {
@@ -4760,7 +5248,7 @@ static void init_layer_scratch(void) {
     s_gated_out  = calloc(cfg.linear_total_value, sizeof(float));
 }
 
-static void fused_layer_forward(
+void fused_layer_forward(
     WeightFile *wf,
     int layer_idx,
     float *hidden,           // [cfg.hidden_dim] in/out
@@ -4829,6 +5317,7 @@ static void fused_layer_forward(
     float *residual = s_residual;
     id<MTLCommandBuffer> cmd1 = nil;
     int gpu_linear_attn = 0;  // set to 1 if GPU handles entire linear attention pipeline
+    int cmd1_cmd2_merged = 0; // set to 1 if CMD2 work is merged into CMD1 (linear attn optimization)
 
     // Pre-compute linear_layer_idx for GPU linear attention encoding in CMD1
     int linear_layer_idx = -1;
@@ -4924,7 +5413,7 @@ static void fused_layer_forward(
             {
                 uint32_t khpv = cfg.linear_num_v_heads / cfg.linear_num_k_heads;  // 4
                 id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->delta_net_step];
+                [enc setComputePipelineState:g_metal->delta_net_step_fused ? g_metal->delta_net_step_fused : g_metal->delta_net_step];
                 [enc setBuffer:g_metal->buf_delta_state[linear_layer_idx] offset:0 atIndex:0]; // persistent state
                 [enc setBuffer:g_metal->buf_conv_output offset:0 atIndex:1]; // q (first 2048 floats)
                 [enc setBuffer:g_metal->buf_conv_output offset:cfg.linear_total_key * sizeof(float) atIndex:2]; // k (next 2048)
@@ -4961,6 +5450,102 @@ static void fused_layer_forward(
             gpu_linear_attn = 1;
         }
 
+        // ---- CMD1+CMD2 merge for linear attention layers ----
+        // When gpu_linear_attn is active, CMD2 (o_proj + residual + norm + routing)
+        // can be encoded directly into CMD1, eliminating one commit+wait cycle.
+        // buf_moe_hidden (from CMD3(N-1)) is used as the residual source on GPU —
+        // serial queue ordering guarantees CMD3(N-1) completes before CMD1 starts.
+        if (g_cmd_merge_enabled && gpu_linear_attn && g_metal->wf_buf &&
+            lc->gate_w && lc->gate_s && lc->gate_b &&
+            lc->sg_w && lc->sg_s && lc->sg_b &&
+            lc->su_w && lc->su_s && lc->su_b &&
+            lc->seg_w && lc->seg_s && lc->seg_b &&
+            g_metal->residual_add && g_metal->rms_norm_sum &&
+            g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w &&
+            g_deferred.gpu_combined && g_metal->buf_moe_hidden) {
+            // batch_out[6] has gated_rms_norm result from CMD1.
+            // buf_moe_hidden has pre-attention hidden (residual) from CMD3(N-1).
+
+            // o_proj matvec into CMD1
+            {
+                uint32_t o_out_dim = cfg.hidden_dim;
+                uint32_t o_in_dim = (uint32_t)cfg.linear_total_value;
+                uint32_t o_gs = cfg.group_size;
+                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->matvec_fast];
+                [enc setBuffer:g_metal->wf_buf offset:(NSUInteger)((const char *)lc->out_proj_w - (const char *)[g_metal->wf_buf contents]) atIndex:0];
+                [enc setBuffer:g_metal->wf_buf offset:(NSUInteger)((const char *)lc->out_proj_s - (const char *)[g_metal->wf_buf contents]) atIndex:1];
+                [enc setBuffer:g_metal->wf_buf offset:(NSUInteger)((const char *)lc->out_proj_b - (const char *)[g_metal->wf_buf contents]) atIndex:2];
+                [enc setBuffer:g_metal->batch_out[6] offset:0 atIndex:3];
+                [enc setBuffer:g_metal->buf_output   offset:0 atIndex:4];
+                [enc setBytes:&o_out_dim  length:4 atIndex:5];
+                [enc setBytes:&o_in_dim   length:4 atIndex:6];
+                [enc setBytes:&o_gs       length:4 atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+            }
+            // residual_add (buf_output + buf_moe_hidden -> buf_h_mid)
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                uint32_t dim = cfg.hidden_dim;
+                [enc setComputePipelineState:g_metal->residual_add];
+                [enc setBuffer:g_metal->buf_moe_hidden offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_output     offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_h_mid      offset:0 atIndex:2];
+                [enc setBytes:&dim length:4 atIndex:3];
+                uint32_t tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // rms_norm_sum_sq (buf_h_mid -> buf_sum_sq)
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                uint32_t dim = cfg.hidden_dim;
+                [enc setComputePipelineState:g_metal->rms_norm_sum];
+                [enc setBuffer:g_metal->buf_h_mid  offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_sum_sq offset:0 atIndex:1];
+                [enc setBytes:&dim length:4 atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // rms_norm_apply_bf16 (buf_h_mid + norm_w -> buf_input)
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                uint32_t dim = cfg.hidden_dim;
+                float eps = cfg.rms_norm_eps;
+                [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
+                [enc setBuffer:g_metal->buf_h_mid  offset:0       atIndex:0];
+                [enc setBuffer:g_metal->wf_buf offset:(NSUInteger)((const char *)lc->post_attn_norm_w - (const char *)[g_metal->wf_buf contents]) atIndex:1];
+                [enc setBuffer:g_metal->buf_sum_sq offset:0       atIndex:2];
+                [enc setBuffer:g_metal->buf_input  offset:0       atIndex:3];
+                [enc setBytes:&dim length:4 atIndex:4];
+                [enc setBytes:&eps length:4 atIndex:5];
+                uint32_t tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // routing + shared expert projections
+            // Slots 0-3: safe to reuse because attention projection results in
+            // batch_out[0-3] have already been consumed by the GPU linear attention
+            // pipeline (conv1d, delta-net, etc.) earlier in this same CMD1.
+            // Metal command encoders execute sequentially within a command buffer.
+            {
+                BatchMatvecSpec moe_specs_merged[4] = {
+                    { lc->gate_w, lc->gate_s, lc->gate_b, s_gate_scores,        (uint32_t)cfg.num_experts,         cfg.hidden_dim, cfg.group_size, 0 },
+                    { lc->sg_w,   lc->sg_s,   lc->sg_b,   s_shared_gate,        (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                    { lc->su_w,   lc->su_s,   lc->su_b,   s_shared_up,          (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                    { lc->seg_w,  lc->seg_s,  lc->seg_b,  &g_merged_shared_gate_score, 1,                         cfg.hidden_dim, cfg.group_size, 3 },
+                };
+                gpu_encode_batch_matvec(g_metal, cmd1, moe_specs_merged, 4);
+            }
+
+            cmd1_cmd2_merged = 1;
+        }
+
         [cmd1 commit];
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
@@ -4971,11 +5556,33 @@ static void fused_layer_forward(
         if (!gpu_linear_attn) {
             gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
         }
+        if (cmd1_cmd2_merged) {
+            // Read back merged CMD2 results (slots 0-3, matching encode above)
+            float m_sgs = 0.0f;
+            BatchMatvecSpec moe_rb[4] = {
+                { NULL, NULL, NULL, s_gate_scores,   (uint32_t)cfg.num_experts,         cfg.hidden_dim, cfg.group_size, 0 },
+                { NULL, NULL, NULL, s_shared_gate,   (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                { NULL, NULL, NULL, s_shared_up,     (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                { NULL, NULL, NULL, &m_sgs,            1,                              cfg.hidden_dim, cfg.group_size, 3 },
+            };
+            gpu_flush_batch_results(g_metal, moe_rb, 4);
+            g_merged_shared_gate_score = m_sgs;
+            // Read h_mid and h_post from GPU
+            memcpy(s_h_mid, [g_metal->buf_h_mid contents], cfg.hidden_dim * sizeof(float));
+            memcpy(s_h_post, [g_metal->buf_input contents], cfg.hidden_dim * sizeof(float));
+            memcpy(hidden, s_h_mid, cfg.hidden_dim * sizeof(float));
+        }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
 
         // Now CMD3(N-1) is done. Read back hidden state from GPU.
         if (g_timing_enabled) { t0 = now_ms(); }
-        finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
+        if (!cmd1_cmd2_merged) {
+            finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
+        } else {
+            // Merged path: hidden already set from buf_h_mid above.
+            g_deferred.active = 0;
+            g_deferred.cmd_experts = nil;
+        }
 
         // Start predicted expert preads AFTER CMD1_wait.
         // CMD3(N-1) is guaranteed done (serial queue), so buf_B is safe to overwrite.
@@ -5083,7 +5690,7 @@ static void fused_layer_forward(
                 {
                     uint32_t khpv = cfg.linear_num_v_heads / cfg.linear_num_k_heads;
                     id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                    [enc setComputePipelineState:g_metal->delta_net_step];
+                    [enc setComputePipelineState:g_metal->delta_net_step_fused ? g_metal->delta_net_step_fused : g_metal->delta_net_step];
                     [enc setBuffer:g_metal->buf_delta_state[linear_layer_idx] offset:0 atIndex:0];
                     [enc setBuffer:g_metal->buf_conv_output offset:0 atIndex:1];
                     [enc setBuffer:g_metal->buf_conv_output offset:cfg.linear_total_key * sizeof(float) atIndex:2];
@@ -5304,17 +5911,49 @@ static void fused_layer_forward(
         // RoPE
         apply_rotary_emb(q, k_out, pos, cfg.num_attn_heads, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim);
 
-        // Update KV cache (CPU + GPU mirror)
-        int cache_pos = kv->len;
+        // Update KV cache (CPU + GPU mirror) — with sliding window + overflow protection
+        int cache_pos;
+        if (kv->h2o_active) {
+            cache_pos = kv->h2o_num_valid;
+            if (cache_pos >= kv->capacity) {
+                fprintf(stderr, "ERROR: H2O KV cache overflow (pos=%d >= cap=%d)\n", cache_pos, kv->capacity);
+                goto skip_full_attn;
+            }
+        } else if (kv->window_size > 0) {
+            cache_pos = kv->len % kv->capacity;  // circular write
+        } else {
+            cache_pos = kv->len;
+            if (cache_pos >= kv->capacity) {
+                fprintf(stderr, "ERROR: KV cache overflow at layer %d (pos=%d >= cap=%d). "
+                        "Consider --sliding-window or --h2o to bound context.\n",
+                        layer_idx, cache_pos, kv->capacity);
+                goto skip_full_attn;
+            }
+        }
         memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
         memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
 
         int fa_idx = cfg.full_attn_index[layer_idx];
         if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
-            memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
-                   k_out, kv_dim * sizeof(float));
-            memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
-                   v_out, kv_dim * sizeof(float));
+            if (g_use_fp8_kv && g_metal->buf_kv_k_scales && g_metal->buf_kv_k_scales[fa_idx]) {
+                // FP8 E4M3 encode: quantize K/V to uint8 with per-position scale
+                uint8_t *k_fp8 = (uint8_t *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim;
+                uint8_t *v_fp8 = (uint8_t *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim;
+                float *k_scales = (float *)[g_metal->buf_kv_k_scales[fa_idx] contents];
+                float *v_scales = (float *)[g_metal->buf_kv_v_scales[fa_idx] contents];
+                k_scales[cache_pos] = fp8_encode_vec(k_out, k_fp8, kv_dim);
+                v_scales[cache_pos] = fp8_encode_vec(v_out, v_fp8, kv_dim);
+            } else {
+                memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
+                       k_out, kv_dim * sizeof(float));
+                memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
+                       v_out, kv_dim * sizeof(float));
+            }
+        }
+        if (kv->h2o_active) {
+            kv->token_positions[cache_pos] = kv->len;
+            kv->attn_scores_accum[cache_pos] = 0.0f;
+            kv->h2o_num_valid++;
         }
         kv->len++;
 
@@ -5324,11 +5963,22 @@ static void fused_layer_forward(
         float *attn_out = s_attn_out;
         memset(attn_out, 0, q_dim * sizeof(float));
 
+        // Effective attention length (H2O, sliding window, or full)
+        int attn_seq_len;
+        if (kv->h2o_active) {
+            attn_seq_len = kv->h2o_num_valid;
+        } else if (kv->window_size > 0 && kv->len > kv->window_size) {
+            attn_seq_len = kv->window_size;
+        } else {
+            attn_seq_len = kv->len;
+        }
+
         // GPU attention: defer dispatches to CMD2 (fused into single cmd buffer).
         // Only enabled when seq_len >= 32 (below that, CPU is faster).
         int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
                               fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers &&
-                              kv->len >= 32 && kv->len < GPU_KV_SEQ);
+                              attn_seq_len >= 32 && attn_seq_len < GPU_KV_SEQ &&
+                              !kv->h2o_active);  // H2O uses CPU for score accumulation
 
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
@@ -5336,22 +5986,35 @@ static void fused_layer_forward(
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
-            // CPU fallback
+            // CPU fallback (also used when H2O is active, for score tracking)
             for (int h = 0; h < cfg.num_attn_heads; h++) {
                 int kv_h = h / heads_per_kv;
                 float *qh = q + h * cfg.head_dim;
-                float *scores = malloc(kv->len * sizeof(float));
-                for (int p = 0; p < kv->len; p++) {
+                float *scores = malloc(attn_seq_len * sizeof(float));
+                if (!scores) continue;
+                for (int i = 0; i < attn_seq_len; i++) {
+                    int p;
+                    if (!kv->h2o_active && kv->window_size > 0 && kv->len > kv->window_size) {
+                        p = (kv->len - kv->window_size + i) % kv->capacity;
+                    } else {
+                        p = i;
+                    }
                     float *kp = kv->k_cache + p * kv_dim + kv_h * cfg.head_dim;
                     float dot = 0.0f;
                     for (int d = 0; d < cfg.head_dim; d++) dot += qh[d] * kp[d];
-                    scores[p] = dot * scale;
+                    scores[i] = dot * scale;
                 }
-                cpu_softmax(scores, kv->len);
+                cpu_softmax(scores, attn_seq_len);
                 float *oh = attn_out + h * cfg.head_dim;
-                for (int p = 0; p < kv->len; p++) {
+                for (int i = 0; i < attn_seq_len; i++) {
+                    int p;
+                    if (!kv->h2o_active && kv->window_size > 0 && kv->len > kv->window_size) {
+                        p = (kv->len - kv->window_size + i) % kv->capacity;
+                    } else {
+                        p = i;
+                    }
                     float *vp = kv->v_cache + p * kv_dim + kv_h * cfg.head_dim;
-                    for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+                    for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[i] * vp[d];
                 }
                 free(scores);
             }
@@ -5367,6 +6030,7 @@ static void fused_layer_forward(
             attn_out_for_oproj = attn_out;
         }
         // q_proj_out, k_out, v_out, q, q_gate, attn_out are static scratch.
+        skip_full_attn:; // jump target when KV cache overflows
     } else if (gpu_linear_attn) {
         // ---- GPU linear attention: already computed in CMD1 ----
         // batch_out[6] already contains gated_rms_norm output (8192 floats)
@@ -5448,7 +6112,7 @@ static void fused_layer_forward(
 
                 id<MTLCommandBuffer> cmd_dn = [g_metal->queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cmd_dn computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->delta_net_step];
+                [enc setComputePipelineState:g_metal->delta_net_step_fused ? g_metal->delta_net_step_fused : g_metal->delta_net_step];
                 [enc setBuffer:g_metal->buf_delta_state[linear_layer_idx] offset:0 atIndex:0];
                 [enc setBuffer:g_metal->buf_delta_q       offset:0 atIndex:1];
                 [enc setBuffer:g_metal->buf_delta_k       offset:0 atIndex:2];
@@ -5554,12 +6218,25 @@ static void fused_layer_forward(
     float *h_post = s_h_post;
     float *h_mid = s_h_mid;
     float *gate_scores = s_gate_scores;
-    memset(gate_scores, 0, cfg.num_experts * sizeof(float));
     float *shared_gate = s_shared_gate;
-    memset(shared_gate, 0, cfg.shared_intermediate * sizeof(float));
     float *shared_up = s_shared_up;
-    memset(shared_up, 0, cfg.shared_intermediate * sizeof(float));
     float shared_gate_score = 0.0f;
+
+    // CMD1+CMD2 merged path: gate_scores/shared_gate/shared_up are already
+    // populated by gpu_flush_batch_results — skip directly to softmax+topK.
+    // MUST jump before memset, which would zero out the GPU results.
+    if (cmd1_cmd2_merged && !is_full) {
+        shared_gate_score = g_merged_shared_gate_score;
+        // h_mid and h_post already populated from GPU readback
+        cpu_vec_copy(residual, h_mid, cfg.hidden_dim);
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_wait += t1 - t0; }
+        goto cmd2_done;
+    }
+
+    // Zero-init for non-merged path (CMD2 will populate these)
+    memset(gate_scores, 0, cfg.num_experts * sizeof(float));
+    memset(shared_gate, 0, cfg.shared_intermediate * sizeof(float));
+    memset(shared_up, 0, cfg.shared_intermediate * sizeof(float));
 
     int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
                             suw && sus && sub && seg_w && seg_s && seg_b);
@@ -5567,8 +6244,13 @@ static void fused_layer_forward(
     // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
     // because GPU command encoder overhead dominates at short sequences.
+    // Use attn_seq_len for GPU attention when available (respects sliding window / H2O)
+    int fused_attn_len = (is_full && kv) ?
+        (kv->h2o_active ? kv->h2o_num_valid :
+         (kv->window_size > 0 && kv->len > kv->window_size) ? kv->window_size : kv->len) : 0;
     int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
-                         && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
+                         && kv && fused_attn_len >= 32 && fused_attn_len < GPU_KV_SEQ
+                         && !kv->h2o_active);
 
     if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
@@ -5611,59 +6293,144 @@ static void fused_layer_forward(
             float scale = 1.0f / sqrtf((float)cfg.head_dim);
             uint32_t hd = cfg.head_dim;
             uint32_t kvd = (uint32_t)kv_dim;
-            uint32_t sl = (uint32_t)kv->len;
+            uint32_t sl = (uint32_t)fused_attn_len;
             uint32_t seq_stride = GPU_KV_SEQ;
             uint32_t hpkv = (uint32_t)heads_per_kv;
+            uint32_t num_heads = cfg.num_attn_heads;
+            uint32_t num_kv_heads = cfg.num_kv_heads;
 
-            // Enc A1: attn_scores_batched
-            {
+            // Fused online softmax attention: single kernel replaces 3-kernel pipeline
+            if (g_fused_attention_enabled && g_metal->fused_attention_fc_pipe) {
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->attn_scores_pipe];
+                [enc setComputePipelineState:g_metal->fused_attention_fc_pipe];
                 [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
                 [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
-                [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
-                [enc setBytes:&hd        length:4 atIndex:3];
-                [enc setBytes:&kvd       length:4 atIndex:4];
-                [enc setBytes:&sl        length:4 atIndex:5];
-                [enc setBytes:&seq_stride length:4 atIndex:6];
-                [enc setBytes:&scale     length:4 atIndex:7];
-                [enc setBytes:&hpkv      length:4 atIndex:8];
-                [enc setBytes:&sl        length:4 atIndex:9];
-                uint32_t total_tgs = sl * cfg.num_attn_heads;
-                [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc endEncoding];
-            }
-            // Enc A2: attn_softmax_batched
-            {
-                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->attn_softmax_pipe];
-                [enc setBuffer:g_metal->buf_attn_scores offset:0 atIndex:0];
-                [enc setBytes:&sl         length:4 atIndex:1];
-                [enc setBytes:&seq_stride  length:4 atIndex:2];
+                if (g_use_fp8_kv && g_metal->buf_kv_k_scales && g_metal->buf_kv_k_scales[fa_idx]) {
+                    [enc setBuffer:g_metal->buf_kv_k_scales[fa_idx] offset:0 atIndex:2];
+                } else {
+                    [enc setBuffer:g_metal->buf_attn_scores  offset:0 atIndex:2]; // unused placeholder
+                }
+                [enc setBuffer:g_metal->buf_kv_v[fa_idx]    offset:0 atIndex:3];
+                if (g_use_fp8_kv && g_metal->buf_kv_v_scales && g_metal->buf_kv_v_scales[fa_idx]) {
+                    [enc setBuffer:g_metal->buf_kv_v_scales[fa_idx] offset:0 atIndex:4];
+                } else {
+                    [enc setBuffer:g_metal->buf_attn_scores  offset:0 atIndex:4]; // unused placeholder
+                }
+                [enc setBuffer:g_metal->buf_attn_out        offset:0 atIndex:5];
+                [enc setBytes:&hd           length:4 atIndex:6];
+                [enc setBytes:&kvd          length:4 atIndex:7];
+                [enc setBytes:&sl           length:4 atIndex:8];
+                [enc setBytes:&num_heads    length:4 atIndex:9];
+                [enc setBytes:&num_kv_heads length:4 atIndex:10];
+                [enc setBytes:&scale        length:4 atIndex:11];
                 [enc dispatchThreadgroups:MTLSizeMake(cfg.num_attn_heads, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
+            } else if (g_use_fp8_kv && g_metal->attn_scores_fp8_pipe && g_metal->attn_values_fp8_pipe &&
+                       g_metal->buf_kv_k_scales && g_metal->buf_kv_k_scales[fa_idx]) {
+                // FP8 3-kernel pipeline
+                // Enc A1: attn_scores_fp8
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->attn_scores_fp8_pipe];
+                    [enc setBuffer:g_metal->buf_attn_q              offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_kv_k[fa_idx]        offset:0 atIndex:1];
+                    [enc setBuffer:g_metal->buf_kv_k_scales[fa_idx] offset:0 atIndex:2];
+                    [enc setBuffer:g_metal->buf_attn_scores         offset:0 atIndex:3];
+                    [enc setBytes:&hd        length:4 atIndex:4];
+                    [enc setBytes:&kvd       length:4 atIndex:5];
+                    [enc setBytes:&sl        length:4 atIndex:6];
+                    [enc setBytes:&seq_stride length:4 atIndex:7];
+                    [enc setBytes:&scale     length:4 atIndex:8];
+                    [enc setBytes:&hpkv      length:4 atIndex:9];
+                    [enc setBytes:&sl        length:4 atIndex:10];
+                    uint32_t total_tgs = sl * cfg.num_attn_heads;
+                    [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+                // Enc A2: attn_softmax_batched (same as float32 path)
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->attn_softmax_pipe];
+                    [enc setBuffer:g_metal->buf_attn_scores offset:0 atIndex:0];
+                    [enc setBytes:&sl         length:4 atIndex:1];
+                    [enc setBytes:&seq_stride  length:4 atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(cfg.num_attn_heads, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+                // Enc A3: attn_values_fp8
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->attn_values_fp8_pipe];
+                    [enc setBuffer:g_metal->buf_attn_scores         offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_kv_v[fa_idx]        offset:0 atIndex:1];
+                    [enc setBuffer:g_metal->buf_kv_v_scales[fa_idx] offset:0 atIndex:2];
+                    [enc setBuffer:g_metal->buf_attn_out            offset:0 atIndex:3];
+                    [enc setBytes:&hd        length:4 atIndex:4];
+                    [enc setBytes:&kvd       length:4 atIndex:5];
+                    [enc setBytes:&sl        length:4 atIndex:6];
+                    [enc setBytes:&seq_stride length:4 atIndex:7];
+                    [enc setBytes:&hpkv      length:4 atIndex:8];
+                    uint32_t total_threads = cfg.head_dim * cfg.num_attn_heads;
+                    uint32_t tgs = (total_threads + 255) / 256;
+                    [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+            } else {
+                // Standard float32 3-kernel pipeline
+                // Enc A1: attn_scores_batched
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->attn_scores_pipe];
+                    [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
+                    [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
+                    [enc setBytes:&hd        length:4 atIndex:3];
+                    [enc setBytes:&kvd       length:4 atIndex:4];
+                    [enc setBytes:&sl        length:4 atIndex:5];
+                    [enc setBytes:&seq_stride length:4 atIndex:6];
+                    [enc setBytes:&scale     length:4 atIndex:7];
+                    [enc setBytes:&hpkv      length:4 atIndex:8];
+                    [enc setBytes:&sl        length:4 atIndex:9];
+                    uint32_t total_tgs = sl * cfg.num_attn_heads;
+                    [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+                // Enc A2: attn_softmax_batched
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->attn_softmax_pipe];
+                    [enc setBuffer:g_metal->buf_attn_scores offset:0 atIndex:0];
+                    [enc setBytes:&sl         length:4 atIndex:1];
+                    [enc setBytes:&seq_stride  length:4 atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(cfg.num_attn_heads, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+                // Enc A3: attn_values_batched
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->attn_values_pipe];
+                    [enc setBuffer:g_metal->buf_attn_scores   offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_kv_v[fa_idx]  offset:0 atIndex:1];
+                    [enc setBuffer:g_metal->buf_attn_out      offset:0 atIndex:2];
+                    [enc setBytes:&hd        length:4 atIndex:3];
+                    [enc setBytes:&kvd       length:4 atIndex:4];
+                    [enc setBytes:&sl        length:4 atIndex:5];
+                    [enc setBytes:&seq_stride length:4 atIndex:6];
+                    [enc setBytes:&hpkv      length:4 atIndex:7];
+                    uint32_t total_threads = cfg.head_dim * cfg.num_attn_heads;
+                    uint32_t tgs = (total_threads + 255) / 256;
+                    [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
             }
-            // Enc A3: attn_values_batched
-            {
-                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->attn_values_pipe];
-                [enc setBuffer:g_metal->buf_attn_scores   offset:0 atIndex:0];
-                [enc setBuffer:g_metal->buf_kv_v[fa_idx]  offset:0 atIndex:1];
-                [enc setBuffer:g_metal->buf_attn_out      offset:0 atIndex:2];
-                [enc setBytes:&hd        length:4 atIndex:3];
-                [enc setBytes:&kvd       length:4 atIndex:4];
-                [enc setBytes:&sl        length:4 atIndex:5];
-                [enc setBytes:&seq_stride length:4 atIndex:6];
-                [enc setBytes:&hpkv      length:4 atIndex:7];
-                uint32_t total_threads = cfg.head_dim * cfg.num_attn_heads;
-                uint32_t tgs = (total_threads + 255) / 256;
-                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc endEncoding];
-            }
-            // Enc A4: sigmoid_gate
+            // Enc A4: sigmoid_gate (same for all paths)
             {
                 uint32_t qdim = cfg.num_attn_heads * cfg.head_dim;
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
@@ -5822,6 +6589,7 @@ static void fused_layer_forward(
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
     }
 
+cmd2_done:
     // ---- Softmax + top-K (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
     cpu_softmax(gate_scores, cfg.num_experts);
@@ -6269,6 +7037,27 @@ static void fused_layer_forward(
             g_deferred.valid[k] = valid[k];
         }
 
+        // Expert cross-layer prefetch: start pread'ing next layer's predicted experts
+        // into buffer set B. The I/O overlaps with GPU compute (CMD3 is running async).
+        // Uses temporal prediction (last token's expert choices for layer+1).
+        // NOTE: Each layer has its own packed_fd. Cross-layer prefetch requires the
+        // caller to store layer fds globally. When g_expert_prefetch_layer_fds is set
+        // (by InferContext setup), this reads the next layer's predicted experts.
+        if (g_expert_prefetch_enabled && g_pred_enabled && g_pred_generating &&
+            g_pred_valid && layer_idx + 1 < cfg.num_layers &&
+            g_metal->buf_multi_expert_data_B[0] &&
+            g_expert_prefetch_layer_fds &&
+            PRED_COUNT(layer_idx + 1) > 0) {
+            int next_fd = g_expert_prefetch_layer_fds[layer_idx + 1];
+            if (next_fd >= 0) {
+                async_pread_start(next_fd, &PRED_EXPERT(layer_idx + 1, 0),
+                                  PRED_COUNT(layer_idx + 1),
+                                  g_metal->buf_multi_expert_data_B, mmap_base,
+                                  layer_idx + 1);
+                g_prefetch_hits_total++;
+            }
+        }
+
         // Return immediately — GPU experts are running async.
         // The next call to fused_layer_forward() or complete_deferred_experts()
         // will wait for the GPU and apply the final combine.
@@ -6641,28 +7430,114 @@ static void http_write_str(int fd, const char *s) {
     http_write(fd, s, (int)strlen(s));
 }
 
-// Send an SSE chunk with a token delta
-// Returns 0 on success, -1 if client disconnected
-static int sse_send_delta(int fd, const char *request_id, const char *token_text) {
-    char chunk[4096];
-    // Escape the token text for JSON
-    char escaped[2048];
-    char *w = escaped;
-    for (const char *r = token_text; *r && w < escaped + sizeof(escaped) - 8; r++) {
-        switch (*r) {
-            case '"':  *w++ = '\\'; *w++ = '"';  break;
-            case '\\': *w++ = '\\'; *w++ = '\\'; break;
-            case '\n': *w++ = '\\'; *w++ = 'n';  break;
-            case '\r': *w++ = '\\'; *w++ = 'r';  break;
-            case '\t': *w++ = '\\'; *w++ = 't';  break;
-            default:   *w++ = *r; break;
+// ============================================================================
+// UTF-8 streaming buffer for serve_loop
+// ============================================================================
+// BPE tokens can split multi-byte UTF-8 sequences across token boundaries
+// (e.g., emoji 👋 = F0 9F 91 8B may be two tokens: [F0 9F] [91 8B]).
+// Each fragment alone is invalid UTF-8, so we buffer partial sequences and
+// only emit complete UTF-8 codepoints.
+
+typedef struct {
+    char  pending[8];   // at most 3 trailing bytes of incomplete sequence
+    int   pending_len;
+} ServeUtf8Buf;
+
+// Returns number of bytes from the END of buf that form an incomplete UTF-8 sequence.
+// 0 means the entire buffer is valid UTF-8.
+static int serve_utf8_incomplete_tail(const char *buf, int len) {
+    if (len == 0) return 0;
+    for (int i = 1; i <= 4 && i <= len; i++) {
+        unsigned char c = (unsigned char)buf[len - i];
+        if ((c & 0x80) == 0) return 0;  // ASCII — complete
+        if ((c & 0xC0) == 0xC0) {
+            int expected;
+            if ((c & 0xE0) == 0xC0) expected = 2;
+            else if ((c & 0xF0) == 0xE0) expected = 3;
+            else if ((c & 0xF8) == 0xF0) expected = 4;
+            else return i;  // invalid start byte
+            if (i >= expected) return 0;  // sequence is complete
+            return i;  // incomplete
         }
     }
-    *w = '\0';
+    return len < 4 ? len : 4;
+}
+
+// Push token bytes through the UTF-8 buffer. Returns pointer to complete UTF-8 string
+// to emit (may be empty ""). out buffer must be at least 256 bytes.
+static const char *serve_utf8_push(ServeUtf8Buf *u, const char *data, int len,
+                                    char *out, int out_size) {
+    int total = u->pending_len + len;
+    if (total >= out_size - 1) total = out_size - 2;
+
+    if (u->pending_len > 0) memcpy(out, u->pending, u->pending_len);
+    int copy_len = total - u->pending_len;
+    if (copy_len > 0) memcpy(out + u->pending_len, data, copy_len);
+    out[total] = '\0';
+
+    int tail = serve_utf8_incomplete_tail(out, total);
+    if (tail > 0) {
+        memcpy(u->pending, out + total - tail, tail);
+        u->pending_len = tail;
+        out[total - tail] = '\0';
+    } else {
+        u->pending_len = 0;
+    }
+    return out;
+}
+
+// Flush remaining pending bytes (at end of generation)
+static const char *serve_utf8_flush(ServeUtf8Buf *u, char *out, int out_size) {
+    if (u->pending_len > 0 && u->pending_len < out_size - 1) {
+        memcpy(out, u->pending, u->pending_len);
+        out[u->pending_len] = '\0';
+        u->pending_len = 0;
+        return out;
+    }
+    out[0] = '\0';
+    return out;
+}
+
+// JSON-escape a string for SSE delta content, handling all control chars
+static int serve_json_escape(const char *src, char *dst, int dst_size) {
+    int j = 0;
+    for (int i = 0; src[i] && j < dst_size - 6; i++) {
+        unsigned char c = (unsigned char)src[i];
+        switch (c) {
+            case '"':  dst[j++] = '\\'; dst[j++] = '"'; break;
+            case '\\': dst[j++] = '\\'; dst[j++] = '\\'; break;
+            case '\n': dst[j++] = '\\'; dst[j++] = 'n'; break;
+            case '\r': dst[j++] = '\\'; dst[j++] = 'r'; break;
+            case '\t': dst[j++] = '\\'; dst[j++] = 't'; break;
+            case '\b': dst[j++] = '\\'; dst[j++] = 'b'; break;
+            case '\f': dst[j++] = '\\'; dst[j++] = 'f'; break;
+            default:
+                if (c < 0x20) {
+                    j += snprintf(dst + j, dst_size - j, "\\u%04x", c);
+                } else {
+                    dst[j++] = c;
+                }
+                break;
+        }
+    }
+    dst[j] = '\0';
+    return j;
+}
+
+// Send an SSE chunk with a token delta (UTF-8 safe content)
+// Returns 0 on success, -1 if client disconnected
+static int sse_send_delta(int fd, const char *request_id, const char *token_text) {
+    if (!token_text || !token_text[0]) return 0;
+
+    char chunk[4096];
+    char escaped[2048];
+    serve_json_escape(token_text, escaped, sizeof(escaped));
+
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
         "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
         request_id, escaped);
+    if (n >= (int)sizeof(chunk)) n = (int)sizeof(chunk) - 1; // clamp to buffer size
     ssize_t wr = write(fd, chunk, n);
     return (wr <= 0) ? -1 : 0;
 }
@@ -6695,7 +7570,7 @@ static const char *CORS_RESPONSE =
 
 // Tokenize a user turn (system prompt already cached in KV).
 // Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
-static PromptTokens *tokenize_user_turn(const char *user_content) {
+PromptTokens *tokenize_user_turn(const char *user_content) {
     const char *prefix = "<|im_start|>user\n";
     const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
 
@@ -6711,7 +7586,7 @@ static PromptTokens *tokenize_user_turn(const char *user_content) {
 // Tokenize a continuation turn for session caching.
 // Prefixes with <|im_end|>\n to close the previous assistant turn, then the new user turn.
 // Used when the KV cache already contains the prior conversation state.
-static PromptTokens *tokenize_continuation_turn(const char *user_content) {
+PromptTokens *tokenize_continuation_turn(const char *user_content) {
     // EOS/<|im_end|> is already in the state (fed through model at end of generation)
     // Just need the newline + new user turn + assistant prompt
     const char *prefix = "\n<|im_start|>user\n";
@@ -6727,7 +7602,7 @@ static PromptTokens *tokenize_continuation_turn(const char *user_content) {
 }
 
 // Load custom system prompt from ~/.flash-moe/system.md, or use default
-static char *load_system_prompt(void) {
+char *load_system_prompt(void) {
     const char *home = getenv("HOME");
     if (home) {
         char path[1024];
@@ -6749,7 +7624,7 @@ static char *load_system_prompt(void) {
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
-static PromptTokens *tokenize_chat_message(const char *user_content) {
+PromptTokens *tokenize_chat_message(const char *user_content) {
     static char *sys_prompt_text = NULL;
     if (!sys_prompt_text) sys_prompt_text = load_system_prompt();
 
@@ -6786,7 +7661,7 @@ static PromptTokens *tokenize_chat_message_old(const char *user_content) {
 
 // The main serve loop. Model state must already be initialized.
 // Sync CPU linear attention state → GPU buffers
-static void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
+void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
     if (!g_metal || !g_metal->delta_net_step || !layer_states) return;
     int li = 0;
     for (int i = 0; i < cfg.num_layers; i++) {
@@ -6903,6 +7778,7 @@ static void serve_loop(
         sync_cpu_to_gpu_delta_state_serve(layer_states);
         fprintf(stderr, "[serve] System prompt cached: %d tokens prefilled\n", sys_pos);
     }
+    free(sys_pt->ids);
     free(sys_pt);
 
     // Save snapshot of KV caches + linear attention state after system prompt
@@ -7226,6 +8102,9 @@ static void serve_loop(
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
 
+            // UTF-8 streaming buffer: ensures we only emit complete codepoints
+            ServeUtf8Buf u8buf = {0};
+
             for (int gen = 0; gen < max_gen; gen++) {
                 if (next_token == cfg.eos_token_ids[0] || next_token == cfg.eos_token_ids[1]) {
                     // Feed EOS through the model so session state includes it
@@ -7264,9 +8143,18 @@ static void serve_loop(
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
                 }
-                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
-                    fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
-                    break;
+                // Push token through UTF-8 buffer to ensure complete codepoints
+                {
+                    char u8out[4096];
+                    int tok_len = tok_str ? (int)strlen(tok_str) : 0;
+                    const char *safe = serve_utf8_push(&u8buf, tok_str, tok_len,
+                                                       u8out, sizeof(u8out));
+                    if (safe[0]) {
+                        if (sse_send_delta(client_fd, request_id, safe) < 0) {
+                            fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
+                            break;
+                        }
+                    }
                 }
                 gen_count++;
 
@@ -7293,6 +8181,13 @@ static void serve_loop(
                 }
                 lm_head_forward(wf, hidden, logits);
                 next_token = cpu_argmax(logits, cfg.vocab_size);
+            }
+
+            // Flush any remaining incomplete UTF-8 bytes before done marker
+            {
+                char u8out[8];
+                const char *safe = serve_utf8_flush(&u8buf, u8out, sizeof(u8out));
+                if (safe[0]) sse_send_delta(client_fd, request_id, safe);
             }
 
             sse_send_done(client_fd, request_id);
@@ -7362,9 +8257,20 @@ static void print_usage(const char *prog) {
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
+    printf("  --fp8                Use FP8 E4M3 KV cache (4x memory reduction)\n");
+    printf("  --fused-attn         Enable fused online softmax attention (experimental)\n");
+    printf("  --fp16               Use FP16 accumulation in dequant kernels (experimental)\n");
+    printf("  --fused-expert       Enable fused gate+up+SwiGLU expert kernel\n");
+    printf("  --no-fused-expert    Disable fused gate+up+SwiGLU expert kernel\n");
+    printf("  --no-cmd-merge       Disable CMD1+CMD2 merge for linear attention\n");
+    printf("  --expert-prefetch    Enable cross-layer expert prefetch\n");
+    printf("  --sliding-window N   Sliding window size for full attention (circular KV cache, 0=unlimited)\n");
+    printf("  --h2o N              H2O KV cache budget (sinks + recent + heavy hitters, 0=disabled)\n");
+    printf("  --h2o-sinks N        Number of attention sink tokens (default: 4)\n");
     printf("  --help               This message\n");
 }
 
+#ifndef INFER_LIB_MODE
 int main(int argc, char **argv) {
     @autoreleasepool {
         const char *model_path = getenv("FLASH_MOE_MODEL");
@@ -7402,6 +8308,17 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"fp8",           no_argument,       0, 1001},
+            {"fused-attn",    no_argument,       0, 1002},
+            {"fp16",          no_argument,       0, 1003},
+            {"fused-expert",  no_argument,       0, 1007},
+            {"no-fused-expert", no_argument,     0, 1004},
+            {"cmd-merge",     no_argument,       0, 1008},
+            {"no-cmd-merge",  no_argument,       0, 1005},
+            {"expert-prefetch", no_argument,     0, 1006},
+            {"sliding-window", required_argument, 0, 1009},
+            {"h2o",            required_argument, 0, 1010},
+            {"h2o-sinks",      required_argument, 0, 1011},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -7437,6 +8354,17 @@ int main(int argc, char **argv) {
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
+                case 1001: g_use_fp8_kv = 1; break;
+                case 1002: g_fused_attention_enabled = 1; break;
+                case 1003: g_use_fp16_accum = 1; break;
+                case 1004: g_fused_expert_enabled = 0; break;
+                case 1005: g_cmd_merge_enabled = 0; break;
+                case 1006: g_expert_prefetch_enabled = 1; break;
+                case 1007: g_fused_expert_enabled = 1; break;
+                case 1008: g_cmd_merge_enabled = 1; break;
+                case 1009: g_sliding_window = atoi(optarg); break;
+                case 1010: g_h2o_budget = atoi(optarg); break;
+                case 1011: g_h2o_num_sinks = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -7830,7 +8758,7 @@ int main(int argc, char **argv) {
             double t_prefill_batch = now_ms();
             double first_tok_ms = 0;
 
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
+            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) { @autoreleasepool {
                 double t_tok = now_ms();
 
                 // Load pre-embedded token from batch buffer
@@ -7857,7 +8785,7 @@ int main(int argc, char **argv) {
                 if (token_idx == 0) {
                     first_tok_ms = now_ms() - t_tok;
                 }
-            }
+            } /* @autoreleasepool */ }
 
             double prefill_batch_ms = now_ms() - t_prefill_batch;
             double avg_ms = (pt->count > 2) ?
@@ -7945,7 +8873,7 @@ int main(int argc, char **argv) {
             g_pred_generating = 1;  // enable prediction storage/use during generation
             g_pred_valid = 0;       // reset — first gen token builds predictions
         }
-        for (int gen = 1; gen < max_tokens; gen++) {
+        for (int gen = 1; gen < max_tokens; gen++) { @autoreleasepool {
             double t_gen_start = now_ms();
 
             // Check EOS
@@ -8008,7 +8936,7 @@ int main(int argc, char **argv) {
             // Print progress to stderr
             fprintf(stderr, "  [gen %d/%d] token_id=%d (%.0f ms, %.2f tok/s)\n",
                     gen, max_tokens, next_token, tok_time, 1000.0 / tok_time);
-        }
+        } /* @autoreleasepool */ }
 
         if (g_timing_enabled) timing_print();
         printf("\n\n--- Statistics ---\n");
@@ -8078,4 +9006,435 @@ int main(int argc, char **argv) {
         return 0;
     }
 }
+#endif // INFER_LIB_MODE
+
+// ============================================================================
+// Inference API wrappers (used by server.m when linked as library)
+// ============================================================================
+
+// ---- Optimization flag setters (call BEFORE infer_init) ----
+void infer_set_fused_expert(int enabled)    { g_fused_expert_enabled = enabled; }
+void infer_set_cmd_merge(int enabled)       { g_cmd_merge_enabled = enabled; }
+void infer_set_fp8_kv(int enabled)          { g_use_fp8_kv = enabled; }
+void infer_set_fused_attention(int enabled) { g_fused_attention_enabled = enabled; }
+void infer_set_fp16_accum(int enabled)      { g_use_fp16_accum = enabled; }
+void infer_set_expert_prefetch(int enabled) { g_expert_prefetch_enabled = enabled; }
+
+void infer_load_model_config(const char *model_dir) {
+    load_model_config(model_dir ? model_dir : "");
+}
+
+InferContext *infer_init(const char *model_path,
+                         const char *weights_path_arg,
+                         const char *manifest_path_arg,
+                         const char *vocab_path_arg,
+                         int K, int use_tiered, int use_2bit) {
+    // Load model configuration
+    infer_load_model_config(model_path);
+
+    // Resolve default paths
+    char default_weights[1024], default_manifest[1024], default_vocab[1024];
+    const char *weights_path = weights_path_arg;
+    const char *manifest_path = manifest_path_arg;
+    const char *vocab_path = vocab_path_arg;
+
+    if (!weights_path) {
+        if (model_path) snprintf(default_weights, sizeof(default_weights), "%s/model_weights.bin", model_path);
+        if (!model_path || access(default_weights, R_OK) != 0) {
+            snprintf(default_weights, sizeof(default_weights), "model_weights.bin");
+        }
+        weights_path = default_weights;
+    }
+    if (!manifest_path) {
+        if (model_path) snprintf(default_manifest, sizeof(default_manifest), "%s/model_weights.json", model_path);
+        if (!model_path || access(default_manifest, R_OK) != 0) {
+            snprintf(default_manifest, sizeof(default_manifest), "model_weights.json");
+        }
+        manifest_path = default_manifest;
+    }
+    if (!vocab_path) {
+        if (model_path) snprintf(default_vocab, sizeof(default_vocab), "%s/vocab.bin", model_path);
+        if (!model_path || access(default_vocab, R_OK) != 0) {
+            snprintf(default_vocab, sizeof(default_vocab), "vocab.bin");
+        }
+        vocab_path = default_vocab;
+    }
+
+    // Allocate tracking arrays + deferred expert state buffer
+    extern void alloc_tracking_arrays(void);
+    alloc_tracking_arrays();
+    g_deferred.h_mid = calloc(cfg.hidden_dim, sizeof(float));
+
+    // Initialize Metal
+    extern MetalCtx *g_metal;
+    g_metal = metal_setup();
+    if (!g_metal) {
+        fprintf(stderr, "WARNING: Metal init failed, falling back to CPU\n");
+    }
+
+    // Initialize I/O thread pool
+    io_pool_init();
+
+    // Handle tiered/2bit modes
+    extern int g_use_tiered, g_use_2bit;
+    g_use_tiered = use_tiered;
+    g_use_2bit = use_2bit;
+
+    // Load weights
+    WeightFile *wf = open_weights(weights_path, manifest_path);
+    if (!wf) {
+        fprintf(stderr, "ERROR: Failed to load weights\n");
+        return NULL;
+    }
+    if (g_metal) {
+        metal_set_weights(g_metal, wf->data, wf->size);
+    }
+
+    // Load vocabulary
+    Vocabulary *vocab = load_vocab(vocab_path);
+    if (!vocab) {
+        fprintf(stderr, "ERROR: Failed to load vocabulary\n");
+        return NULL;
+    }
+
+    // Auto-detect tiered experts
+    extern int load_tiered_manifest(const char *model_path);
+    if (!g_use_2bit && !g_use_tiered && model_path) {
+        char probe[1024];
+        snprintf(probe, sizeof(probe), "%s/packed_experts_tiered/tiered_manifest.json", model_path);
+        if (access(probe, F_OK) == 0) {
+            if (load_tiered_manifest(model_path)) {
+                g_use_tiered = 1;
+            }
+        }
+    }
+    if (g_use_tiered) {
+        extern TieredExpertInfo *g_tiered_manifest;
+        if (!g_tiered_manifest) {
+            if (!load_tiered_manifest(model_path)) {
+                fprintf(stderr, "WARNING: --tiered but no tiered_manifest.json found\n");
+                g_use_tiered = 0;
+            }
+        }
+    }
+
+    // Open packed expert files
+    int *layer_fds = calloc(cfg.num_layers, sizeof(int));
+    void **layer_mmaps = calloc(cfg.num_layers, sizeof(void *));
+    int expert_layers = 0;
+
+    for (int i = 0; i < cfg.num_layers; i++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
+                 g_use_tiered ? "packed_experts_tiered" :
+                 g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
+        layer_fds[i] = open(path, O_RDONLY);
+        layer_mmaps[i] = MAP_FAILED;
+        if (layer_fds[i] >= 0) {
+            expert_layers++;
+            fcntl(layer_fds[i], F_RDAHEAD, 0);
+            struct stat st;
+            if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
+                layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
+                if (layer_mmaps[i] == MAP_FAILED) layer_mmaps[i] = MAP_FAILED;
+            }
+        }
+    }
+    printf("[experts] %d/%d packed layer files available\n", expert_layers, cfg.num_layers);
+
+    // Cold fd setup
+    extern int *g_layer_fds_cold;
+    int *layer_fds_cold = calloc(cfg.num_layers, sizeof(int));
+    for (int i = 0; i < cfg.num_layers; i++) layer_fds_cold[i] = -1;
+    g_layer_fds_cold = layer_fds_cold;
+
+    // Set global layer fds for cross-layer expert prefetch
+    if (g_expert_prefetch_enabled) {
+        g_expert_prefetch_layer_fds = layer_fds;
+    }
+
+    // Warm page cache
+    for (int i = 0; i < cfg.num_layers; i++) {
+        if (layer_fds[i] >= 0) {
+            char dummy[4096];
+            pread(layer_fds[i], dummy, sizeof(dummy), 0);
+        }
+    }
+
+    // Allocate per-layer state
+    void **layer_states = calloc(cfg.num_layers, sizeof(void *));
+    KVCache **kv_caches = (KVCache **)calloc(cfg.num_layers, sizeof(KVCache *));
+
+    for (int i = 0; i < cfg.num_layers; i++) {
+        int is_full = cfg.is_full_attn[i];
+        if (is_full) {
+            kv_caches[i] = kv_cache_new();
+        } else {
+            layer_states[i] = linear_attn_state_new();
+        }
+    }
+
+    // Allocate working buffers
+    float *hidden = calloc(cfg.hidden_dim, sizeof(float));
+    float *logits = calloc(cfg.vocab_size, sizeof(float));
+    uint16_t *final_norm_w = get_tensor_ptr(wf, "model.norm.weight");
+
+    // Build context
+    InferContext *ctx = calloc(1, sizeof(InferContext));
+    ctx->wf = wf;
+    ctx->vocab = vocab;
+    ctx->layer_states = layer_states;
+    ctx->kv_caches = kv_caches;
+    ctx->layer_mmaps = layer_mmaps;
+    ctx->layer_fds = layer_fds;
+    ctx->hidden = hidden;
+    ctx->logits = logits;
+    ctx->final_norm_w = final_norm_w;
+    ctx->K = K;
+
+    printf("[server] Inference context initialized (K=%d, %s)\n", K,
+           g_use_tiered ? "tiered" : g_use_2bit ? "2-bit" : "4-bit");
+    return ctx;
+}
+
+void infer_shutdown(InferContext *ctx) {
+    if (!ctx) return;
+    free(ctx->hidden);
+    free(ctx->logits);
+    for (int i = 0; i < cfg.num_layers; i++) {
+        if (ctx->layer_fds[i] >= 0) close(ctx->layer_fds[i]);
+    }
+    free(ctx->layer_states);
+    free(ctx->kv_caches);
+    free(ctx->layer_mmaps);
+    free(ctx->layer_fds);
+    free(ctx);
+}
+
+PromptTokens *infer_encode_text(const char *text) {
+    return encode_prompt_text_to_tokens(text);
+}
+
+void infer_free_tokens(PromptTokens *pt) {
+    if (pt) {
+        free(pt->ids);
+        free(pt);
+    }
+}
+
+const char *infer_decode_token(InferContext *ctx, int token_id) {
+    return decode_token(ctx->vocab, token_id);
+}
+
+void infer_embed_token(InferContext *ctx, int token_id) {
+    embed_lookup(ctx->wf, token_id, ctx->hidden);
+}
+
+void infer_forward_layer(InferContext *ctx, int layer, int pos) {
+    int is_full = cfg.is_full_attn[layer];
+    fused_layer_forward(ctx->wf, layer, ctx->hidden,
+        is_full ? ctx->kv_caches[layer] : NULL,
+        is_full ? NULL : (LinearAttnState *)ctx->layer_states[layer],
+        pos,
+        ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
+        ctx->K, ctx->layer_fds[layer]);
+}
+
+void infer_complete_deferred(void) {
+    complete_deferred_experts();
+}
+
+void infer_discard_deferred(void) {
+    discard_deferred_experts();
+}
+
+// No-wait variant: same as infer_discard_deferred() but semantically marks
+// that we don't need the result. Currently identical implementation because
+// GPU buffer safety requires waiting, but kept as a separate entry point
+// for future optimization (if GPU queue serialization makes the wait redundant).
+void infer_discard_deferred_nowait(void) {
+    discard_deferred_experts();
+}
+
+void infer_final_norm(InferContext *ctx) {
+    if (ctx->final_norm_w) {
+        float *normed = malloc(cfg.hidden_dim * sizeof(float));
+        cpu_rms_norm(ctx->hidden, ctx->final_norm_w, normed, cfg.hidden_dim, cfg.rms_norm_eps);
+        memcpy(ctx->hidden, normed, cfg.hidden_dim * sizeof(float));
+        free(normed);
+    }
+}
+
+void infer_lm_head(InferContext *ctx) {
+    lm_head_forward(ctx->wf, ctx->hidden, ctx->logits);
+}
+
+int infer_argmax(InferContext *ctx) {
+    return cpu_argmax(ctx->logits, cfg.vocab_size);
+}
+
+float *infer_get_logits(InferContext *ctx) {
+    return ctx->logits;
+}
+
+int infer_is_eos(int token_id) {
+    for (int i = 0; i < cfg.num_eos_tokens; i++) {
+        if (token_id == cfg.eos_token_ids[i]) return 1;
+    }
+    return 0;
+}
+
+void infer_reset_state(InferContext *ctx) {
+    reset_delta_net_state();
+    size_t kv_dim = cfg.num_kv_heads * cfg.head_dim;
+    for (int i = 0; i < cfg.num_layers; i++) {
+        if (ctx->kv_caches[i]) {
+            // Only zero the portion actually used (up to len), not the full max_seq_len.
+            // calloc already zeroed the rest. This avoids touching 5+ GB of virtual memory
+            // and forcing physical page allocation on startup.
+            int used = ctx->kv_caches[i]->len;
+            if (used > 0) {
+                memset(ctx->kv_caches[i]->k_cache, 0, (size_t)used * kv_dim * sizeof(float));
+                memset(ctx->kv_caches[i]->v_cache, 0, (size_t)used * kv_dim * sizeof(float));
+            }
+            ctx->kv_caches[i]->len = 0;
+        }
+        if (ctx->layer_states[i]) {
+            LinearAttnState *s = (LinearAttnState *)ctx->layer_states[i];
+            memset(s->conv_state, 0, (cfg.conv_kernel_size - 1) * cfg.linear_conv_dim * sizeof(float));
+            memset(s->ssm_state, 0, cfg.linear_num_v_heads * cfg.linear_value_dim * cfg.linear_key_dim * sizeof(float));
+        }
+    }
+}
+
+void infer_sync_delta_state(InferContext *ctx) {
+    sync_cpu_to_gpu_delta_state_serve(ctx->layer_states);
+}
+
+InferStateSnapshot *infer_snapshot_state(InferContext *ctx, int pos) {
+    InferStateSnapshot *snap = calloc(1, sizeof(InferStateSnapshot));
+    snap->pos = pos;
+
+    size_t kv_dim = cfg.num_kv_heads * cfg.head_dim;
+    size_t conv_state_size = (cfg.conv_kernel_size - 1) * cfg.linear_conv_dim * sizeof(float);
+    size_t ssm_state_size = cfg.linear_num_v_heads * cfg.linear_value_dim * cfg.linear_key_dim * sizeof(float);
+
+    snap->kv_k_snapshots = calloc(cfg.num_layers, sizeof(float *));
+    snap->kv_v_snapshots = calloc(cfg.num_layers, sizeof(float *));
+    snap->kv_lens = calloc(cfg.num_layers, sizeof(int));
+    snap->la_conv_snapshots = calloc(cfg.num_layers, sizeof(float *));
+    snap->la_ssm_snapshots = calloc(cfg.num_layers, sizeof(float *));
+
+    for (int i = 0; i < cfg.num_layers; i++) {
+        if (ctx->kv_caches[i]) {
+            size_t sz = pos * kv_dim * sizeof(float);
+            snap->kv_k_snapshots[i] = malloc(sz);
+            snap->kv_v_snapshots[i] = malloc(sz);
+            memcpy(snap->kv_k_snapshots[i], ctx->kv_caches[i]->k_cache, sz);
+            memcpy(snap->kv_v_snapshots[i], ctx->kv_caches[i]->v_cache, sz);
+            snap->kv_lens[i] = ctx->kv_caches[i]->len;
+        }
+        if (ctx->layer_states[i]) {
+            LinearAttnState *s = (LinearAttnState *)ctx->layer_states[i];
+            snap->la_conv_snapshots[i] = malloc(conv_state_size);
+            snap->la_ssm_snapshots[i] = malloc(ssm_state_size);
+            memcpy(snap->la_conv_snapshots[i], s->conv_state, conv_state_size);
+            memcpy(snap->la_ssm_snapshots[i], s->ssm_state, ssm_state_size);
+        }
+    }
+
+    // GPU delta-net snapshots
+    extern MetalCtx *g_metal;
+    snap->gpu_delta_snapshots = calloc(cfg.num_linear_layers, sizeof(void *));
+    snap->gpu_conv_snapshots = calloc(cfg.num_linear_layers, sizeof(void *));
+    if (g_metal && g_metal->delta_net_step) {
+        for (int i = 0; i < cfg.num_linear_layers; i++) {
+            if (g_metal->buf_delta_state[i]) {
+                size_t sz = (size_t)cfg.linear_num_v_heads * cfg.linear_value_dim * cfg.linear_key_dim * sizeof(float);
+                snap->gpu_delta_snapshots[i] = malloc(sz);
+                memcpy(snap->gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], sz);
+            }
+            if (g_metal->buf_conv_state[i]) {
+                size_t sz = (cfg.conv_kernel_size - 1) * (size_t)cfg.linear_conv_dim * sizeof(float);
+                snap->gpu_conv_snapshots[i] = malloc(sz);
+                memcpy(snap->gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], sz);
+            }
+        }
+    }
+
+    return snap;
+}
+
+void infer_restore_state(InferContext *ctx, InferStateSnapshot *snap) {
+    if (!snap) return;
+
+    size_t kv_dim = cfg.num_kv_heads * cfg.head_dim;
+    size_t conv_state_size = (cfg.conv_kernel_size - 1) * cfg.linear_conv_dim * sizeof(float);
+    size_t ssm_state_size = cfg.linear_num_v_heads * cfg.linear_value_dim * cfg.linear_key_dim * sizeof(float);
+
+    extern MetalCtx *g_metal;
+    for (int i = 0; i < cfg.num_layers; i++) {
+        if (ctx->kv_caches[i] && snap->kv_k_snapshots[i]) {
+            size_t sz = snap->pos * kv_dim * sizeof(float);
+            memcpy(ctx->kv_caches[i]->k_cache, snap->kv_k_snapshots[i], sz);
+            memcpy(ctx->kv_caches[i]->v_cache, snap->kv_v_snapshots[i], sz);
+            ctx->kv_caches[i]->len = snap->kv_lens[i];
+            // Restore GPU KV mirror
+            if (g_metal) {
+                int fa_idx = cfg.full_attn_index[i];
+                if (fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
+                    memcpy([g_metal->buf_kv_k[fa_idx] contents], snap->kv_k_snapshots[i], sz);
+                    memcpy([g_metal->buf_kv_v[fa_idx] contents], snap->kv_v_snapshots[i], sz);
+                }
+            }
+        } else if (ctx->kv_caches[i]) {
+            ctx->kv_caches[i]->len = 0;
+        }
+        if (ctx->layer_states[i] && snap->la_conv_snapshots[i]) {
+            LinearAttnState *s = (LinearAttnState *)ctx->layer_states[i];
+            memcpy(s->conv_state, snap->la_conv_snapshots[i], conv_state_size);
+            memcpy(s->ssm_state, snap->la_ssm_snapshots[i], ssm_state_size);
+        } else if (ctx->layer_states[i]) {
+            LinearAttnState *s = (LinearAttnState *)ctx->layer_states[i];
+            memset(s->conv_state, 0, conv_state_size);
+            memset(s->ssm_state, 0, ssm_state_size);
+        }
+    }
+    // Restore GPU delta-net state
+    if (g_metal && g_metal->delta_net_step) {
+        for (int i = 0; i < cfg.num_linear_layers; i++) {
+            if (snap->gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
+                memcpy([g_metal->buf_delta_state[i] contents], snap->gpu_delta_snapshots[i],
+                       (size_t)cfg.linear_num_v_heads * cfg.linear_value_dim * cfg.linear_key_dim * sizeof(float));
+            if (snap->gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
+                memcpy([g_metal->buf_conv_state[i] contents], snap->gpu_conv_snapshots[i],
+                       (cfg.conv_kernel_size - 1) * (size_t)cfg.linear_conv_dim * sizeof(float));
+        }
+    } else {
+        reset_delta_net_state();
+    }
+}
+
+void infer_free_snapshot(InferStateSnapshot *snap) {
+    if (!snap) return;
+    for (int i = 0; i < cfg.num_layers; i++) {
+        free(snap->kv_k_snapshots[i]);
+        free(snap->kv_v_snapshots[i]);
+        free(snap->la_conv_snapshots[i]);
+        free(snap->la_ssm_snapshots[i]);
+    }
+    for (int i = 0; i < cfg.num_linear_layers; i++) {
+        free(snap->gpu_delta_snapshots[i]);
+        free(snap->gpu_conv_snapshots[i]);
+    }
+    free(snap->kv_k_snapshots);
+    free(snap->kv_v_snapshots);
+    free(snap->kv_lens);
+    free(snap->la_conv_snapshots);
+    free(snap->la_ssm_snapshots);
+    free(snap->gpu_delta_snapshots);
+    free(snap->gpu_conv_snapshots);
+    free(snap);
+}
+
 #endif // CHAT_MODE

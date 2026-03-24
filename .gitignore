@@ -3,6 +3,7 @@ metal_infer/infer
 metal_infer/chat
 metal_infer/metal_infer
 metal_infer/bench_pread
+metal_infer/server
 *.o
 *.air
 *.metallib
@@ -35,3 +36,8 @@ logs/
 metal_infer/test_lzfse
 metal_infer/repack_experts_lz4
 metal_infer/routing_data.bin
+
+# Trash
+.claude/
+.vscode/
+./metal_infer
