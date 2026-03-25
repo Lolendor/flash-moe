@@ -29,6 +29,13 @@ typedef struct {
     int vocab_size;
     float rms_norm_eps;
 
+    // Model type: 0=Qwen3.5, 1=MiniMax
+    int model_type;
+    char moe_prefix[32];          // "mlp" (Qwen) or "block_sparse_moe" (MiniMax)
+    int has_attn_gate;            // 1=Qwen (Q proj includes sigmoid gate), 0=MiniMax
+    int scoring_func;             // 0=softmax (Qwen), 1=sigmoid (MiniMax)
+    int qk_norm_per_layer;        // 0=per-head (Qwen), 1=per-layer (MiniMax)
+
     // MoE
     int num_experts;
     int num_experts_per_tok;
@@ -36,6 +43,8 @@ typedef struct {
     int shared_intermediate;
     int group_size;
     int bits;
+    int gate_bits;                // routing gate quantization bits (may differ from expert bits)
+    int gate_group_size;          // routing gate group size
 
     // Linear attention (GatedDeltaNet)
     int linear_num_v_heads;
@@ -255,5 +264,36 @@ void infer_set_fp16_accum(int enabled);
 
 // Cross-layer expert prefetch (default OFF)
 void infer_set_expert_prefetch(int enabled);
+
+// NAX tensor matmul for LM head (Metal 4 / M5+, default OFF — slower for M=1 decode)
+void infer_set_nax(int enabled);
+
+// ============================================================================
+// Batched prefill (call BEFORE infer_init to configure, then use infer_prefill)
+// ============================================================================
+
+// Set prefill batch size (default 1 = no batching, recommended 64-128)
+void infer_set_prefill_batch(int batch_size);
+
+// Skip routed experts during prefill (shared expert only, fastest)
+void infer_set_prefill_skip_experts(int enabled);
+
+// K=0 for linear layers, full K for full-attn layers (best quality)
+void infer_set_prefill_experts_full_only(int enabled);
+
+// Batched prefill: process all intermediate prompt tokens through the model.
+// Embeds tokens, runs batched prefill (or per-token fallback), updates pos.
+// Does NOT process the last token — caller must handle it for full completion.
+// Returns number of tokens prefilled (= num_tokens - 1), or 0 if num_tokens <= 1.
+// Returns fewer tokens if aborted early (check infer_prefill_was_aborted()).
+int infer_prefill(InferContext *ctx, const uint32_t *token_ids, int num_tokens, int pos_start);
+
+// Prefill abort: signal prefill to stop early (thread-safe, atomic).
+// Call infer_request_prefill_abort() from any thread to interrupt an in-progress prefill.
+// The prefill loop checks this flag every token (per-token path) or every layer (batched path).
+// After prefill returns, check infer_prefill_was_aborted() and call infer_clear_prefill_abort().
+void infer_request_prefill_abort(void);
+void infer_clear_prefill_abort(void);
+int infer_prefill_was_aborted(void);
 
 #endif // INFER_API_H

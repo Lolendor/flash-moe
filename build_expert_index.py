@@ -65,11 +65,12 @@ def main():
     weight_map = idx['weight_map']
 
     # Find all expert tensor names: pattern is
-    #   model.layers.{L}.switch_mlp.{gate_proj|up_proj|down_proj}.{weight|scales|biases}
+    #   model.layers.{L}.{mlp.|block_sparse_moe.}switch_mlp.{gate_proj|up_proj|down_proj}.{weight|scales|biases}
+    # Supports both Qwen (mlp.switch_mlp) and MiniMax (block_sparse_moe.switch_mlp)
     # or with language_model. prefix
     import re
     expert_pattern = re.compile(
-        r'(?:language_model\.)?model\.layers\.(\d+)\.(?:mlp\.)?switch_mlp\.'
+        r'(?:language_model\.)?model\.layers\.(\d+)\.(?:mlp\.|block_sparse_moe\.)?switch_mlp\.'
         r'(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$'
     )
 

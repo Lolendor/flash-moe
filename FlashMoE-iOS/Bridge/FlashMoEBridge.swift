@@ -26,6 +26,7 @@ struct ModelInfo {
     let numLayers: Int
     let numExperts: Int
     let activeExpertsK: Int
+    let defaultExpertsK: Int
     let hiddenDim: Int
     let vocabSize: Int
     let weightFileBytes: UInt64
@@ -56,6 +57,10 @@ final class FlashMoEEngine: @unchecked Sendable {
     private(set) var tokensPerSecond: Double = 0
     private(set) var tokensGenerated: Int = 0
     private(set) var timeToFirstToken: Double = 0
+    private(set) var prefillBatchSize: Int = 1
+    private(set) var prefillBatchedLinear: Bool = true
+    private(set) var prefillTokensPerSecond: Double = 0
+    private(set) var prefillBatched: Bool = false
 
     // Private engine state
     private var context: OpaquePointer?  // FlashMoEContext*
@@ -76,7 +81,12 @@ final class FlashMoEEngine: @unchecked Sendable {
     /// Load a model. Set `activeExpertsK` to reduce expert count for large models on small devices.
     /// For example, K=4 on a K=10 model cuts I/O by 60%.
     func loadModel(at path: String, maxContext: Int = 0, thinkBudget: Int = 2048,
-                   useTiered: Bool = false, activeExpertsK: Int = 0, cacheIOSplit: Int = 1,
+                   useTiered: Bool = false, activeExpertsK: Int = 0, use2bit: Bool = false,
+                   cacheIOSplit: Int = 1, activeK: Int = 0,
+                   prefillBatch: Int = 64,
+                   prefillBatchedLinear: Bool = true,
+                   prefillSkipExperts: Bool = true,
+                   prefillExpertsFullOnly: Bool = false,
                    verbose: Bool = false) async throws {
         guard state != .loading && state != .generating else {
             throw FlashMoEError.busy
@@ -110,6 +120,14 @@ final class FlashMoEEngine: @unchecked Sendable {
                 config.use_tiered = useTiered ? 1 : 0
                 config.active_experts_k = Int32(activeExpertsK)
                 config.cache_io_split = Int32(cacheIOSplit)
+                config.active_k = Int32(activeK)
+                let effectivePrefillBatch = max(prefillBatch, 1)
+                let effectiveSkipExperts = prefillSkipExperts && effectivePrefillBatch > 1
+                let effectiveBatchedLinear = effectivePrefillBatch > 1 ? prefillBatchedLinear : false
+                config.prefill_batch = Int32(effectivePrefillBatch)
+                config.prefill_skip_experts = effectiveSkipExperts ? 1 : 0
+                config.prefill_experts_full_only = (!effectiveSkipExperts && prefillExpertsFullOnly) ? 1 : 0
+                config.prefill_batched_linear = effectiveBatchedLinear ? 1 : 0
                 config.verbose = verbose ? 1 : 0
 
                 // Load
@@ -133,6 +151,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                     numLayers: Int(stats.num_layers),
                     numExperts: Int(stats.num_experts),
                     activeExpertsK: Int(stats.active_experts_k),
+                    defaultExpertsK: Int(stats.default_experts_k),
                     hiddenDim: Int(stats.hidden_dim),
                     vocabSize: Int(stats.vocab_size),
                     weightFileBytes: UInt64(stats.weight_file_bytes),
@@ -140,8 +159,12 @@ final class FlashMoEEngine: @unchecked Sendable {
                     metalBufferBytes: UInt64(stats.metal_buffer_bytes)
                 )
 
+                let pfb = effectivePrefillBatch
+                let pbl = effectiveBatchedLinear
                 DispatchQueue.main.async {
                     self.modelInfo = info
+                    self.prefillBatchSize = pfb
+                    self.prefillBatchedLinear = pbl
                     self.state = .ready
                 }
                 continuation.resume()
@@ -208,6 +231,12 @@ final class FlashMoEEngine: @unchecked Sendable {
                         // Update engine stats on main thread
                         if let engine = context.engine {
                             DispatchQueue.main.async {
+                                // Capture prefill tok/s at the transition from prefill to decode
+                                if engine.tokensGenerated < 0 && tokensGenerated >= 0 {
+                                    // Prefill just finished — tokensPerSecond was prefill speed
+                                    engine.prefillTokensPerSecond = engine.tokensPerSecond
+                                    engine.prefillBatched = engine.prefillBatchSize > 1
+                                }
                                 engine.tokensGenerated = Int(tokensGenerated)
                                 engine.tokensPerSecond = tokensPerSecond
                             }
@@ -230,6 +259,8 @@ final class FlashMoEEngine: @unchecked Sendable {
                     self?.timeToFirstToken = stats.ttft_ms
                     self?.tokensPerSecond = stats.tokens_per_second
                     self?.tokensGenerated = Int(stats.tokens_generated)
+                    self?.prefillTokensPerSecond = stats.prefill_tps
+                    self?.prefillBatched = stats.prefill_batched != 0
                     self?.state = .ready
                     self?.isGenerating = false
                 }
@@ -284,6 +315,10 @@ final class FlashMoEEngine: @unchecked Sendable {
 
                         if let engine = context.engine {
                             DispatchQueue.main.async {
+                                if engine.tokensGenerated < 0 && tokensGenerated >= 0 {
+                                    engine.prefillTokensPerSecond = engine.tokensPerSecond
+                                    engine.prefillBatched = engine.prefillBatchSize > 1
+                                }
                                 engine.tokensGenerated = Int(tokensGenerated)
                                 engine.tokensPerSecond = tokensPerSecond
                             }
@@ -314,6 +349,8 @@ final class FlashMoEEngine: @unchecked Sendable {
                     self?.timeToFirstToken = stats.ttft_ms
                     self?.tokensPerSecond = stats.tokens_per_second
                     self?.tokensGenerated = Int(stats.tokens_generated)
+                    self?.prefillTokensPerSecond = stats.prefill_tps
+                    self?.prefillBatched = stats.prefill_batched != 0
                     self?.state = .ready
                     self?.isGenerating = false
                 }
@@ -348,6 +385,38 @@ final class FlashMoEEngine: @unchecked Sendable {
     /// Check if a model directory contains a valid Flash-MoE model
     static func validateModel(at path: String) -> Bool {
         return flashmoe_validate_model(path) == 0
+    }
+
+    // MARK: - Optimization Toggles
+
+    func setGPUCombine(_ enabled: Bool) {
+        flashmoe_set_gpu_combine(enabled ? 1 : 0)
+    }
+
+    func setGPULinearAttn(_ enabled: Bool) {
+        flashmoe_set_gpu_linear_attn(enabled ? 1 : 0)
+    }
+
+    func setExpertPrefetch(_ enabled: Bool) {
+        flashmoe_set_expert_prefetch(enabled ? 1 : 0)
+    }
+
+    // MARK: - Profiling
+
+    func runProfile(numTokens: Int = 20) async -> String? {
+        guard let ctx = context else { return nil }
+        return await withCheckedContinuation { continuation in
+            engineQueue.async {
+                let result = flashmoe_run_profile(ctx, Int32(numTokens))
+                if let result {
+                    let report = String(cString: result)
+                    free(result)
+                    continuation.resume(returning: report)
+                } else {
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
     }
 }
 

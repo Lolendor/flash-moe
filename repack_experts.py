@@ -24,23 +24,45 @@ import os
 import time
 import sys
 
-# Component order and expected sizes
-COMPONENTS = [
-    {"name": "gate_proj.weight",  "offset": 0,       "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "gate_proj.scales",  "offset": 2097152,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "gate_proj.biases",  "offset": 2228224,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.weight",    "offset": 2359296,  "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "up_proj.scales",    "offset": 4456448,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.biases",    "offset": 4587520,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "down_proj.weight",  "offset": 4718592,  "size": 2097152, "dtype": "U32", "shape": [4096, 128]},
-    {"name": "down_proj.scales",  "offset": 6815744,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
-    {"name": "down_proj.biases",  "offset": 6946816,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
+# Component packing order (names match expert_index.json keys)
+COMPONENT_ORDER = [
+    "gate_proj.weight", "gate_proj.scales", "gate_proj.biases",
+    "up_proj.weight",   "up_proj.scales",   "up_proj.biases",
+    "down_proj.weight",  "down_proj.scales",  "down_proj.biases",
 ]
 
-EXPERT_SIZE = 7077888   # bytes per expert
-NUM_EXPERTS = 512
-NUM_LAYERS = 60
-LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 3,623,878,656 bytes (~3.63 GB)
+# These are computed dynamically from the expert index (see compute_layout_from_index)
+COMPONENTS = None   # list of {"name", "offset", "size"}
+EXPERT_SIZE = 0
+NUM_EXPERTS = 0
+NUM_LAYERS = 0
+LAYER_SIZE = 0
+
+
+def compute_layout_from_index(expert_reads):
+    """Compute COMPONENTS, EXPERT_SIZE, NUM_EXPERTS, NUM_LAYERS from expert_index.json data."""
+    global COMPONENTS, EXPERT_SIZE, NUM_EXPERTS, NUM_LAYERS, LAYER_SIZE
+
+    NUM_LAYERS = len(expert_reads)
+    # Use first layer to determine sizes
+    first_layer = expert_reads[next(iter(expert_reads))]
+    # Determine NUM_EXPERTS from the first component's shape
+    first_comp_info = first_layer[COMPONENT_ORDER[0]]
+    NUM_EXPERTS = first_comp_info['shape'][0]
+
+    # Build COMPONENTS with offsets computed from expert_size (per-expert size)
+    COMPONENTS = []
+    offset = 0
+    for comp_name in COMPONENT_ORDER:
+        info = first_layer[comp_name]
+        size = info['expert_size']
+        COMPONENTS.append({"name": comp_name, "offset": offset, "size": size})
+        offset += size
+
+    EXPERT_SIZE = offset
+    LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE
+    print(f"Layout: {NUM_LAYERS} layers, {NUM_EXPERTS} experts, {EXPERT_SIZE} bytes/expert, "
+          f"{LAYER_SIZE / 1e9:.2f} GB/layer")
 
 
 def parse_layers(spec):
@@ -227,6 +249,9 @@ def main():
     expert_reads, model_path = load_index(args.index)
     print(f"Model path: {model_path}")
     print(f"Layers in index: {len(expert_reads)}")
+
+    # Compute layout from index (replaces hardcoded constants)
+    compute_layout_from_index(expert_reads)
 
     # Verify component sizes
     if not verify_component_sizes(expert_reads):

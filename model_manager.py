@@ -30,13 +30,15 @@ HF_CACHE = Path(os.path.expanduser("~/.cache/huggingface/hub"))
 HF_API = "https://huggingface.co/api"
 
 # Known compatible model types
-COMPATIBLE_MODEL_TYPES = {"qwen3_5_moe"}
+COMPATIBLE_MODEL_TYPES = {"qwen3_5_moe", "minimax_m2"}
 
-# Search queries — MLX-quantized Qwen3.5 models
+# Search queries — MLX-quantized MoE models
 SEARCH_QUERIES = [
     "mlx-community Qwen3.5",
     "mlx Qwen3.5 MoE",
     "lmstudio-community Qwen3.5 MLX",
+    "mlx-community MiniMax-M2",
+    "mlx MiniMax M2.5",
 ]
 
 # MoE model name patterns: "35B-A3B", "122B-A10B", "397B-A17B" etc.
@@ -81,15 +83,25 @@ def check_compatibility(model_path: Path) -> dict:
             "reason": f"Incompatible model_type: {model_type} (need: {', '.join(COMPATIBLE_MODEL_TYPES)})",
         }
 
-    tc = config.get("text_config", {})
+    # Qwen wraps in text_config, MiniMax is flat
+    tc = config.get("text_config", None)
     if not tc:
-        return {"compatible": False, "reason": "Missing text_config in config.json"}
+        if model_type == "minimax_m2":
+            tc = config  # MiniMax: flat config
+        else:
+            return {"compatible": False, "reason": "Missing text_config in config.json"}
 
-    # Check for required fields
-    required = [
-        "hidden_size", "num_hidden_layers", "num_experts",
-        "num_experts_per_tok", "moe_intermediate_size",
-    ]
+    # Check for required fields (field names vary by model)
+    if model_type == "minimax_m2":
+        required = [
+            "hidden_size", "num_hidden_layers", "num_local_experts",
+            "num_experts_per_tok", "intermediate_size",
+        ]
+    else:
+        required = [
+            "hidden_size", "num_hidden_layers", "num_experts",
+            "num_experts_per_tok", "moe_intermediate_size",
+        ]
     missing = [k for k in required if k not in tc]
     if missing:
         return {"compatible": False, "reason": f"Missing fields: {', '.join(missing)}"}
@@ -114,9 +126,9 @@ def check_compatibility(model_path: Path) -> dict:
         "model_type": model_type,
         "hidden_size": tc.get("hidden_size"),
         "num_layers": tc.get("num_hidden_layers"),
-        "num_experts": tc.get("num_experts"),
+        "num_experts": tc.get("num_local_experts", tc.get("num_experts")),
         "experts_per_tok": tc.get("num_experts_per_tok"),
-        "moe_intermediate": tc.get("moe_intermediate_size"),
+        "moe_intermediate": tc.get("intermediate_size", tc.get("moe_intermediate_size")),
         "vocab_size": tc.get("vocab_size"),
         "bits": bits,
         "group_size": group_size,

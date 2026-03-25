@@ -258,4 +258,70 @@ print(f"  content: {content}")
 assert "<think>" not in content, f"Expected no <think> tags, got: {content}"
 print("  (no <think> tags — model continued from prefix)")
 
+# 10. Batch prefill stress test — long prompt to exercise batched prefill path
+print("\n=== Batch prefill (long prompt) ===")
+long_prompt = (
+    "Below is a list of 50 famous scientists and their key contributions:\n"
+    + "\n".join(
+        f"{i+1}. Scientist_{i}: discovered principle_{i} in the year {1900+i}"
+        for i in range(50)
+    )
+    + "\n\nBased on the list above, which scientist made a discovery in 1925? "
+    "Answer with just the scientist name and discovery."
+)
+t0 = time.time()
+resp = client.chat.completions.create(
+    model="flash-moe",
+    messages=[{"role": "user", "content": long_prompt}],
+    max_tokens=60,
+    temperature=0,
+    stream=False,
+)
+elapsed = time.time() - t0
+content = resp.choices[0].message.content
+usage = resp.usage
+print(f"  prompt_tokens:     {usage.prompt_tokens}")
+print(f"  completion_tokens: {usage.completion_tokens}")
+print(f"  total_tokens:      {usage.total_tokens}")
+print(f"  content:           {content[:120]}")
+print(f"  elapsed:           {elapsed:.1f}s")
+print(f"  prefill speed:     {usage.prompt_tokens / elapsed:.1f} tok/s (prompt)")
+assert usage.prompt_tokens > 200, (
+    f"Expected >200 prompt tokens for batch prefill test, got {usage.prompt_tokens}"
+)
+print("  (long prompt exercises batched prefill / NAX GEMM path)")
+
+# 11. Batch prefill — streaming with long context
+print("\n=== Batch prefill (streaming, long context) ===")
+multi_paragraph = "\n\n".join(
+    f"Paragraph {i+1}: The quick brown fox jumps over the lazy dog. "
+    f"This is sentence number {i+1} in a long document that tests prefill batching. "
+    f"The value associated with this paragraph is {i * 7}."
+    for i in range(30)
+)
+t0 = time.time()
+stream = client.chat.completions.create(
+    model="flash-moe",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant. Be concise."},
+        {"role": "user", "content": multi_paragraph + "\n\nWhat is the value in paragraph 15?"},
+    ],
+    max_tokens=40,
+    temperature=0,
+    stream=True,
+)
+tokens_received = 0
+print("  ", end="", flush=True)
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if delta.content:
+        print(delta.content, end="", flush=True)
+        tokens_received += 1
+elapsed = time.time() - t0
+print(f"\n  tokens received:   {tokens_received}")
+print(f"  elapsed:           {elapsed:.1f}s")
+print(f"  TTFT + generation in {elapsed:.1f}s")
+assert tokens_received > 0, "Expected at least some tokens from streaming long-context"
+print("  (streaming long context exercises batched prefill + NAX)")
+
 print("\n=== All tests passed ===")

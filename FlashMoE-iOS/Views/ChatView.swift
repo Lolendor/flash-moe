@@ -28,9 +28,21 @@ struct ChatView: View {
     @State private var inputText = ""
     @State private var isGenerating = false
     @State private var showStats = false
+    @AppStorage("chatTemplateEnabled") private var chatTemplateEnabled: Bool = true
+    @AppStorage("noThinkingEnabled") private var noThinkingEnabled: Bool = false
+    @AppStorage("maxGenerationTokens") private var maxGenerationTokens: Int = 2048
     @State private var showModelInfo = false
-    @State private var showProfiler = false
+    @AppStorage("showProfilerPanel") private var showProfiler = false
+    @State private var isProfileRunning = false
+    @State private var profileResult: String?
+    @State private var showProfileResult = false
     @FocusState private var inputFocused: Bool
+
+    private var shortModelName: String {
+        guard let info = engine.modelInfo else { return "Flash-MoE" }
+        let folder = (info.name as NSString).lastPathComponent
+        return folder.isEmpty ? "Flash-MoE" : folder
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -61,7 +73,11 @@ struct ChatView: View {
                     tokensPerSecond: engine.tokensPerSecond,
                     tokensGenerated: engine.tokensGenerated,
                     isGenerating: isGenerating,
-                    ttftMs: engine.timeToFirstToken
+                    ttftMs: engine.timeToFirstToken,
+                    prefillBatchSize: engine.prefillBatchSize,
+                    prefillBatchedLinear: engine.prefillBatchedLinear,
+                    prefillTokensPerSecond: engine.prefillTokensPerSecond,
+                    prefillBatched: engine.prefillBatched
                 )
             }
 
@@ -102,7 +118,7 @@ struct ChatView: View {
             }
         }
         .animation(.easeInOut(duration: 0.25), value: showProfiler)
-        .navigationTitle("Flash-MoE")
+        .navigationTitle(shortModelName)
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -125,6 +141,7 @@ struct ChatView: View {
                     }
                     Divider()
                     Button("Models & Settings", systemImage: "gearshape") {
+                        engine.cancel()
                         messages.removeAll()
                         engine.reset()
                         engine.unloadModel()
@@ -155,6 +172,7 @@ struct ChatView: View {
                     }
                     Divider()
                     Button("Models & Settings", systemImage: "gearshape") {
+                        engine.cancel()
                         messages.removeAll()
                         engine.reset()
                         engine.unloadModel()
@@ -225,6 +243,11 @@ struct ChatView: View {
                 }
             }
 
+            // If assistant message is still empty after generation, show placeholder
+            if messages.indices.contains(assistantIndex) && messages[assistantIndex].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                messages[assistantIndex].text = "(No response — model returned empty output)"
+            }
+
             isGenerating = false
         }
     }
@@ -245,7 +268,12 @@ struct ChatView: View {
             }
         }
 
-        prompt += "<|im_start|>assistant\n"
+        if noThinkingEnabled {
+            // Pre-fill empty think block to skip reasoning
+            prompt += "<|im_start|>assistant\n<think>\n</think>\n"
+        } else {
+            prompt += "<|im_start|>assistant\n"
+        }
         return prompt
     }
 }
@@ -366,6 +394,10 @@ struct StatsBar: View {
     let tokensGenerated: Int
     let isGenerating: Bool
     var ttftMs: Double = 0
+    var prefillBatchSize: Int = 1
+    var prefillBatchedLinear: Bool = true
+    var prefillTokensPerSecond: Double = 0
+    var prefillBatched: Bool = false
 
     private var ttftText: String {
         if ttftMs <= 0 { return "" }
@@ -408,6 +440,27 @@ struct StatsBar: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
+            if tokensGenerated > 0 && prefillTokensPerSecond > 0 {
+                Label(
+                    String(format: "prefill %.0f t/s%@", prefillTokensPerSecond,
+                           prefillBatched ? " (bat)" : ""),
+                    systemImage: "arrow.right.circle"
+                )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if tokensGenerated < 0 {
+                Label(
+                    prefillBatchSize > 1
+                        ? "batch=\(prefillBatchSize) linear=\(prefillBatchedLinear ? "batched" : "per-tok")"
+                        : "per-token",
+                    systemImage: "cpu"
+                )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Spacer()
 
             if isGenerating {
@@ -433,7 +486,7 @@ struct ModelInfoSheet: View {
                 List {
                     Section("Architecture") {
                         InfoRow(label: "Layers", value: "\(info.numLayers)")
-                        InfoRow(label: "Experts", value: "\(info.numExperts) (K=\(info.activeExpertsK))")
+                        InfoRow(label: "Experts", value: "\(info.numExperts) total, K=\(info.activeExpertsK) active (default \(info.defaultExpertsK))")
                         InfoRow(label: "Hidden Dim", value: "\(info.hiddenDim)")
                         InfoRow(label: "Vocab Size", value: "\(info.vocabSize)")
                     }
@@ -468,4 +521,3 @@ struct InfoRow: View {
         }
     }
 }
-

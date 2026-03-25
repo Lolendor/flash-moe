@@ -66,12 +66,68 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <compression.h>
+#include <stdatomic.h>
 
 // ============================================================================
 // Runtime model configuration (populated from HuggingFace config.json)
 // ============================================================================
 
 #include "infer_api.h"
+
+// ---- Compatibility macros for incoming Q3/batched-prefill code ----
+// The incoming branch (9d1d602) used cfg.* and compile-time macros; HEAD uses cfg.* and runtime config.
+// These bridge the gap so incoming code compiles against HEAD's ModelConfig.
+#define MAX_LAYERS          64
+#define MAX_EXPERTS         512
+#define MAX_HIDDEN_DIM      4096
+#define EXPERT_SIZE         ((int)cfg.expert_size_4bit)
+#define EXPERT_SIZE_2BIT    ((int)cfg.expert_size_2bit)
+#define GATE_W_OFF_2        ((int)cfg.gate_w_off_2)
+#define GATE_S_OFF_2        ((int)cfg.gate_s_off_2)
+#define GATE_B_OFF_2        ((int)cfg.gate_b_off_2)
+#define UP_W_OFF_2          ((int)cfg.up_w_off_2)
+#define UP_S_OFF_2          ((int)cfg.up_s_off_2)
+#define UP_B_OFF_2          ((int)cfg.up_b_off_2)
+#define DOWN_W_OFF_2        ((int)cfg.down_w_off_2)
+#define DOWN_S_OFF_2        ((int)cfg.down_s_off_2)
+#define DOWN_B_OFF_2        ((int)cfg.down_b_off_2)
+// Q3 expert sizes (from incoming branch's GGUF Q3 support)
+#define IQ3_XXS_EXPERT_PROJ_SIZE 1605632
+#define EXPERT_SIZE_Q3_HYBRID    5439488
+#define GATE_W_OFF_Q3  0
+#define UP_W_OFF_Q3    (GATE_W_OFF_Q3 + IQ3_XXS_EXPERT_PROJ_SIZE)
+#define DOWN_W_OFF_Q3  (UP_W_OFF_Q3   + IQ3_XXS_EXPERT_PROJ_SIZE)
+#define DOWN_S_OFF_Q3  DOWN_W_OFF_Q3
+#define DOWN_B_OFF_Q3  DOWN_W_OFF_Q3
+#define IQ4_XS_EXPERT_PROJ_SIZE              2228224
+#define Q5_K_EXPERT_PROJ_SIZE                2883584
+#define EXPERT_SIZE_Q3_OUTLIER               7340032
+#define GATE_W_OFF_Q3_OUTLIER  0
+#define UP_W_OFF_Q3_OUTLIER    (GATE_W_OFF_Q3_OUTLIER + IQ4_XS_EXPERT_PROJ_SIZE)
+#define DOWN_W_OFF_Q3_OUTLIER  (UP_W_OFF_Q3_OUTLIER   + IQ4_XS_EXPERT_PROJ_SIZE)
+#define DOWN_S_OFF_Q3_OUTLIER  DOWN_W_OFF_Q3_OUTLIER
+#define DOWN_B_OFF_Q3_OUTLIER  DOWN_W_OFF_Q3_OUTLIER
+#define Q3_OUTLIER_LAYER       27
+#define NUM_LAYERS          (cfg.num_layers)
+#define NUM_EXPERTS         (cfg.num_experts)
+#define HIDDEN_DIM          (cfg.hidden_dim)
+#define RMS_NORM_EPS        (cfg.rms_norm_eps)
+#define NUM_ATTN_HEADS      (cfg.num_attn_heads)
+#define NUM_KV_HEADS        (cfg.num_kv_heads)
+#define HEAD_DIM            (cfg.head_dim)
+#define GROUP_SIZE          (cfg.group_size)
+#define ROTARY_DIM          (cfg.rotary_dim)
+#define SHARED_INTERMEDIATE (cfg.shared_intermediate)
+#define MOE_INTERMEDIATE    (cfg.moe_intermediate)
+#define VOCAB_SIZE          (cfg.vocab_size)
+#define ROPE_THETA          (cfg.rope_theta)
+#define LINEAR_CONV_DIM     (cfg.linear_conv_dim)
+#define LINEAR_TOTAL_VALUE  (cfg.linear_total_value)
+#define LINEAR_TOTAL_KEY    (cfg.linear_total_key)
+#define LINEAR_NUM_V_HEADS  (cfg.linear_num_v_heads)
+#define LINEAR_NUM_K_HEADS  (cfg.linear_num_k_heads)
+#define LINEAR_KEY_DIM      (cfg.linear_key_dim)
+#define LINEAR_VALUE_DIM    (cfg.linear_value_dim)
 
 ModelConfig cfg;
 
@@ -183,9 +239,32 @@ void load_model_config(const char *model_dir) {
         fprintf(stderr, "FATAL: failed to parse config.json: %s\n", [[jsonErr localizedDescription] UTF8String]);
         exit(1);
     }
+    // ---- Detect model type and resolve config dict ----
+    // Qwen3.5 wraps model params in "text_config", MiniMax is flat.
     NSDictionary *tc = root[@"text_config"];
-    if (!tc) { fprintf(stderr, "FATAL: config.json missing text_config\n"); exit(1); }
+    NSString *model_type_str = root[@"model_type"];
+    if (!model_type_str && tc) model_type_str = tc[@"model_type"];
 
+    if ([model_type_str isEqualToString:@"minimax_m2"]) {
+        cfg.model_type = 1;
+        if (!tc) tc = root;  // MiniMax: flat config
+        strlcpy(cfg.moe_prefix, "block_sparse_moe", sizeof(cfg.moe_prefix));
+        cfg.has_attn_gate = 0;
+        cfg.scoring_func = 1;  // sigmoid
+        cfg.qk_norm_per_layer = 1;
+        fprintf(stderr, "[config] Detected model: minimax_m2\n");
+    } else {
+        // Default: Qwen3.5 MoE
+        cfg.model_type = 0;
+        if (!tc) { fprintf(stderr, "FATAL: config.json missing text_config\n"); exit(1); }
+        strlcpy(cfg.moe_prefix, "mlp", sizeof(cfg.moe_prefix));
+        cfg.has_attn_gate = 1;
+        cfg.scoring_func = 0;  // softmax
+        cfg.qk_norm_per_layer = 0;
+        fprintf(stderr, "[config] Detected model: qwen3_5_moe\n");
+    }
+
+    // ---- Core architecture (same field names for both) ----
     cfg.hidden_dim       = [tc[@"hidden_size"] intValue];
     cfg.num_layers       = [tc[@"num_hidden_layers"] intValue];
     cfg.num_attn_heads   = [tc[@"num_attention_heads"] intValue];
@@ -193,18 +272,31 @@ void load_model_config(const char *model_dir) {
     cfg.head_dim         = tc[@"head_dim"] ? [tc[@"head_dim"] intValue] : (cfg.hidden_dim / cfg.num_attn_heads);
     cfg.vocab_size       = [tc[@"vocab_size"] intValue];
     cfg.rms_norm_eps     = [tc[@"rms_norm_eps"] floatValue];
-    cfg.num_experts      = [tc[@"num_experts"] intValue];
-    cfg.num_experts_per_tok = [tc[@"num_experts_per_tok"] intValue];
-    cfg.moe_intermediate = [tc[@"moe_intermediate_size"] intValue];
-    cfg.shared_intermediate = [tc[@"shared_expert_intermediate_size"] intValue];
+    cfg.max_seq_len      = [tc[@"max_position_embeddings"] intValue];
+
+    // ---- MoE dimensions (field names differ per model) ----
+    if (cfg.model_type == 1) {
+        // MiniMax: num_local_experts, intermediate_size, shared_intermediate_size
+        cfg.num_experts      = [tc[@"num_local_experts"] intValue];
+        cfg.num_experts_per_tok = [tc[@"num_experts_per_tok"] intValue];
+        cfg.moe_intermediate = [tc[@"intermediate_size"] intValue];
+        cfg.shared_intermediate = [tc[@"shared_intermediate_size"] intValue];
+    } else {
+        // Qwen: num_experts, moe_intermediate_size, shared_expert_intermediate_size
+        cfg.num_experts      = [tc[@"num_experts"] intValue];
+        cfg.num_experts_per_tok = [tc[@"num_experts_per_tok"] intValue];
+        cfg.moe_intermediate = [tc[@"moe_intermediate_size"] intValue];
+        cfg.shared_intermediate = [tc[@"shared_expert_intermediate_size"] intValue];
+    }
+
+    // ---- Linear attention (GatedDeltaNet) — Qwen only, zero for MiniMax ----
     cfg.linear_num_v_heads = [tc[@"linear_num_value_heads"] intValue];
     cfg.linear_num_k_heads = [tc[@"linear_num_key_heads"] intValue];
     cfg.linear_key_dim   = tc[@"linear_key_head_dim"] ? [tc[@"linear_key_head_dim"] intValue] : 128;
     cfg.linear_value_dim = tc[@"linear_value_head_dim"] ? [tc[@"linear_value_head_dim"] intValue] : 128;
     cfg.conv_kernel_size = tc[@"linear_conv_kernel_dim"] ? [tc[@"linear_conv_kernel_dim"] intValue] : 4;
-    cfg.max_seq_len      = [tc[@"max_position_embeddings"] intValue];
 
-    // Quantization
+    // ---- Quantization ----
     NSDictionary *qc = root[@"quantization_config"] ?: root[@"quantization"];
     if (qc) {
         cfg.group_size = [qc[@"group_size"] intValue];
@@ -214,26 +306,53 @@ void load_model_config(const char *model_dir) {
         cfg.bits       = 4;
         fprintf(stderr, "[config] WARNING: no quantization_config, defaulting to 4-bit group_size=64\n");
     }
+    // Routing gate may have different quantization (e.g. MiniMax uses 8-bit gate)
+    cfg.gate_bits = cfg.bits;
+    cfg.gate_group_size = cfg.group_size;
+    if (qc) {
+        // Check for per-layer gate overrides: "model.layers.0.block_sparse_moe.gate" etc.
+        NSString *gate0_key = [NSString stringWithFormat:@"model.layers.0.%s.gate", cfg.moe_prefix];
+        NSDictionary *gate_qc = qc[gate0_key];
+        if (gate_qc) {
+            cfg.gate_bits = [gate_qc[@"bits"] intValue];
+            cfg.gate_group_size = [gate_qc[@"group_size"] intValue];
+            fprintf(stderr, "[config] Routing gate quantization: %d-bit, group_size=%d\n",
+                    cfg.gate_bits, cfg.gate_group_size);
+        }
+    }
 
-    // RoPE parameters
+    // ---- RoPE parameters ----
     NSDictionary *rope = tc[@"rope_parameters"];
     if (rope) {
+        // Qwen: nested rope_parameters
         cfg.rope_theta    = [rope[@"rope_theta"] floatValue];
         cfg.partial_rotary = [rope[@"partial_rotary_factor"] floatValue];
+    } else if (tc[@"rope_theta"]) {
+        // MiniMax: flat rope_theta + explicit rotary_dim
+        cfg.rope_theta    = [tc[@"rope_theta"] floatValue];
+        cfg.partial_rotary = 0.0f;  // not used when rotary_dim is explicit
     } else {
         cfg.rope_theta    = 10000000.0f;
         cfg.partial_rotary = 0.25f;
     }
 
-    // Layer types
-    NSArray *layerTypes = tc[@"layer_types"];
+    // ---- Layer types ----
     cfg.is_full_attn    = calloc(cfg.num_layers, sizeof(bool));
     cfg.full_attn_index = malloc(cfg.num_layers * sizeof(int));
     cfg.linear_index    = malloc(cfg.num_layers * sizeof(int));
 
+    // Try explicit layer_types array (Qwen style: ["linear_attention", "full_attention", ...])
+    NSArray *layerTypes = tc[@"layer_types"];
+    // Also try attn_type_list (MiniMax style: [1, 1, 1, ...] where 1=full)
+    NSArray *attnTypeList = tc[@"attn_type_list"] ?: root[@"attn_type_list"];
+
     if (layerTypes && [layerTypes count] == (NSUInteger)cfg.num_layers) {
         for (int i = 0; i < cfg.num_layers; i++) {
             cfg.is_full_attn[i] = [layerTypes[i] isEqualToString:@"full_attention"];
+        }
+    } else if (attnTypeList && [attnTypeList count] == (NSUInteger)cfg.num_layers) {
+        for (int i = 0; i < cfg.num_layers; i++) {
+            cfg.is_full_attn[i] = ([attnTypeList[i] intValue] == 1);
         }
     } else {
         int interval = tc[@"full_attention_interval"] ? [tc[@"full_attention_interval"] intValue] : 4;
@@ -256,7 +375,7 @@ void load_model_config(const char *model_dir) {
     cfg.num_full_attn_layers = full_count;
     cfg.num_linear_layers = linear_count;
 
-    // EOS tokens (can be int or array in config.json)
+    // ---- EOS tokens (can be int or array in config.json) ----
     id eosVal = root[@"eos_token_id"];
     if ([eosVal isKindOfClass:[NSArray class]]) {
         NSArray *arr = (NSArray *)eosVal;
@@ -269,7 +388,7 @@ void load_model_config(const char *model_dir) {
         cfg.eos_token_ids[0] = [eosVal intValue];
     }
 
-    // Think tokens from tokenizer.json added_tokens
+    // ---- Think tokens from tokenizer.json added_tokens ----
     NSString *tokPath = [base stringByAppendingPathComponent:@"tokenizer.json"];
     if ([fm fileExistsAtPath:tokPath]) {
         NSData *tokData = [NSData dataWithContentsOfFile:tokPath];
@@ -287,23 +406,34 @@ void load_model_config(const char *model_dir) {
         fprintf(stderr, "[config] WARNING: tokenizer.json not found, think tokens disabled\n");
     }
 
-    // Derived dimensions
+    // ---- Derived dimensions ----
     cfg.linear_total_key   = cfg.linear_num_k_heads * cfg.linear_key_dim;
     cfg.linear_total_value = cfg.linear_num_v_heads * cfg.linear_value_dim;
     cfg.linear_conv_dim    = cfg.linear_total_key * 2 + cfg.linear_total_value;
-    cfg.rotary_dim         = (int)(cfg.head_dim * cfg.partial_rotary);
+
+    // RoPE rotary_dim: explicit field takes priority, otherwise computed from partial_rotary
+    if (tc[@"rotary_dim"]) {
+        cfg.rotary_dim = [tc[@"rotary_dim"] intValue];
+    } else {
+        cfg.rotary_dim = (int)(cfg.head_dim * cfg.partial_rotary);
+    }
 
     // Expert byte offsets
     compute_expert_offsets(&cfg);
 
-    // Summary
+    // ---- Summary ----
     fprintf(stderr, "[config] %d layers (%d linear + %d full), hidden=%d, heads=%d, kv_heads=%d, head_dim=%d\n",
             cfg.num_layers, cfg.num_linear_layers, cfg.num_full_attn_layers,
             cfg.hidden_dim, cfg.num_attn_heads, cfg.num_kv_heads, cfg.head_dim);
-    fprintf(stderr, "[config] %d experts (K=%d), moe_intermediate=%d, shared=%d\n",
-            cfg.num_experts, cfg.num_experts_per_tok, cfg.moe_intermediate, cfg.shared_intermediate);
-    fprintf(stderr, "[config] %d-bit quantization, group_size=%d, expert_size=%zu bytes\n",
-            cfg.bits, cfg.group_size, cfg.expert_size_4bit);
+    fprintf(stderr, "[config] %d experts (K=%d), moe_intermediate=%d, shared=%d, routing=%s\n",
+            cfg.num_experts, cfg.num_experts_per_tok, cfg.moe_intermediate, cfg.shared_intermediate,
+            cfg.scoring_func ? "sigmoid" : "softmax");
+    fprintf(stderr, "[config] %d-bit quantization, group_size=%d, expert_size=%zu bytes, rotary_dim=%d\n",
+            cfg.bits, cfg.group_size, cfg.expert_size_4bit, cfg.rotary_dim);
+    if (cfg.gate_bits != cfg.bits)
+        fprintf(stderr, "[config] Routing gate: %d-bit, group_size=%d\n", cfg.gate_bits, cfg.gate_group_size);
+    fprintf(stderr, "[config] attn_gate=%d, qk_norm_per_layer=%d, moe_prefix=%s\n",
+            cfg.has_attn_gate, cfg.qk_norm_per_layer, cfg.moe_prefix);
     fprintf(stderr, "[config] EOS tokens: [");
     for (int i = 0; i < cfg.num_eos_tokens; i++)
         fprintf(stderr, "%s%d", i ? ", " : "", cfg.eos_token_ids[i]);
@@ -596,6 +726,37 @@ static inline void fp8_decode_vec(const uint8_t *src, float *dst, int n, float s
         dst[i] = fp8_e4m3_decode(src[i], scale);
     }
 }
+static int g_use_q3_experts = 0;         // enabled by --q3-experts flag: use packed_experts_Q3/ with exact GGUF routed experts
+static int g_layer_is_q3_hybrid[MAX_LAYERS];  // per-layer quant: 1=Q3 hybrid, 0=4-bit
+static int g_use_q3_outlier = 0;  // active layer override: exact layer-27 IQ4_XS gate/up + Q5_K down
+static int g_layer_is_q3_outlier[MAX_LAYERS];
+static int g_layer_is_2bit[MAX_LAYERS];  // per-layer quant: 1=2-bit, 0=4-bit (for mixed quant)
+static int g_stream_mode = 0;    // --stream: clean output only, no progress/stats
+static int g_nax_disabled = 1;   // NAX disabled by default (slower for M=1 decode); --nax to enable
+static int g_nax_min_batch = 4;  // minimum batch size to use NAX (M=1 wastes 31/32 of tile)
+
+// ---- Prefill batching ----
+static int g_prefill_batch = 1;  // --pfb N: batch N tokens per layer during prefill (default 1 = no batching)
+static int g_prefill_skip_experts = 0; // --prefill-skip-experts: skip routed expert I/O during intermediate prefill tokens
+static int g_prefill_k = -1;  // --prefill-k N: override K for intermediate prefill tokens (-1 = use default)
+static int g_prefill_experts_full_only = 0; // --prefill-experts-full-only: K=0 for linear layers, full K for full-attn layers
+#define MAX_PFB 256              // maximum prefill batch size
+#define MAX_PFB_GPU 32           // FMA kernel accumulator limit (float acc[32])
+#define MAX_PFB_NAX 128          // NAX kernel has no static limit; 128 balances memory vs throughput
+
+// ---- Prefill abort ----
+static atomic_int g_prefill_abort = 0;  // set to 1 to abort prefill early
+
+// ---- Optimization toggles (for A/B profiling) ----
+static int g_disable_gpu_combine = 0;    // disable fused CMD3 combine+residual+norm on GPU
+static int g_disable_fused_experts = 0;  // disable batched expert GPU encoding (fall back to sequential)
+static int g_disable_expert_prefetch = 0;// disable async pread prefetch (use synchronous pread)
+static int g_disable_batched_linear = 0; // set to 1 to disable batched linear prefill (A/B testing)
+// gpu_linear_attn_enabled already exists (line ~4629) for fused attention toggle
+
+static inline int effective_prefill_skip_experts(void) {
+    return g_prefill_skip_experts;
+}
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [cfg.num_layers] cold fds (set in main)
@@ -616,9 +777,301 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
     return warm_fd;
 }
 
+typedef enum {
+    EXPERT_QUANT_4BIT = 0,
+    EXPERT_QUANT_2BIT = 1,
+    EXPERT_QUANT_Q3_HYBRID = 2,
+    EXPERT_QUANT_Q3_OUTLIER = 3,
+} ExpertQuantKind;
+
+typedef enum {
+    EXPERT_PROJ_AFFINE = 0,
+    EXPERT_PROJ_IQ3_XXS = 1,
+    EXPERT_PROJ_IQ4_XS = 2,
+    EXPERT_PROJ_Q5_K = 3,
+} ExpertProjectionKind;
+
+typedef struct {
+    size_t expert_size;
+    NSUInteger gate_w_off, gate_s_off, gate_b_off;
+    NSUInteger up_w_off, up_s_off, up_b_off;
+    NSUInteger down_w_off, down_s_off, down_b_off;
+    ExpertProjectionKind gate_kind;
+    ExpertProjectionKind up_kind;
+    ExpertProjectionKind down_kind;
+} ExpertLayout;
+
+static ExpertLayout g_q3_layer_layouts[MAX_LAYERS];
+static int g_q3_layer_layout_valid[MAX_LAYERS];
+static int g_q3_layout_manifest_loaded = 0;
+static ExpertLayout g_active_q3_layout;
+static int g_active_q3_layout_valid = 0;
+
+static inline ExpertProjectionKind expert_projection_kind_from_quant_name(const char *quant_name) {
+    if (!quant_name) return EXPERT_PROJ_AFFINE;
+    if (strcmp(quant_name, "IQ3_XXS") == 0) return EXPERT_PROJ_IQ3_XXS;
+    if (strcmp(quant_name, "IQ4_XS") == 0) return EXPERT_PROJ_IQ4_XS;
+    if (strcmp(quant_name, "Q5_K") == 0) return EXPERT_PROJ_Q5_K;
+    return EXPERT_PROJ_AFFINE;
+}
+
+static inline int expert_layout_is_q3_outlier(const ExpertLayout *layout) {
+    if (!layout) return 0;
+    return layout->gate_kind == EXPERT_PROJ_IQ4_XS ||
+           layout->up_kind == EXPERT_PROJ_IQ4_XS ||
+           layout->down_kind == EXPERT_PROJ_Q5_K;
+}
+
+static inline ExpertQuantKind active_expert_quant_kind(void) {
+    if (g_use_q3_outlier) return EXPERT_QUANT_Q3_OUTLIER;
+    if (g_use_q3_experts) return EXPERT_QUANT_Q3_HYBRID;
+    if (g_use_2bit) return EXPERT_QUANT_2BIT;
+    return EXPERT_QUANT_4BIT;
+}
+
+static inline ExpertQuantKind layer_expert_quant_kind(int layer) {
+    if (g_layer_is_q3_outlier[layer]) return EXPERT_QUANT_Q3_OUTLIER;
+    if (g_layer_is_q3_hybrid[layer]) return EXPERT_QUANT_Q3_HYBRID;
+    if (g_layer_is_2bit[layer]) return EXPERT_QUANT_2BIT;
+    return EXPERT_QUANT_4BIT;
+}
+
+// Per-expert quant kind for tiered mode
+static inline ExpertQuantKind tiered_expert_quant_kind(int layer, int expert) {
+    if (g_use_tiered && g_tiered_manifest) {
+        return (TIERED(layer, expert).bits == 2) ? EXPERT_QUANT_2BIT : EXPERT_QUANT_4BIT;
+    }
+    return layer_expert_quant_kind(layer);
+}
+
+static int parse_q3_layout_components(NSArray *components, size_t expert_size, ExpertLayout *layout_out) {
+    if (!components || !layout_out) return 0;
+    ExpertLayout layout = {0};
+    layout.expert_size = expert_size;
+    int have_gate = 0, have_up = 0, have_down = 0;
+
+    for (NSDictionary *comp in components) {
+        NSString *name = comp[@"name"];
+        NSString *quant = comp[@"quant"];
+        NSNumber *offset_num = comp[@"offset"];
+        if (!name || !quant || !offset_num) continue;
+        NSUInteger off = (NSUInteger)[offset_num unsignedLongLongValue];
+        ExpertProjectionKind kind = expert_projection_kind_from_quant_name([quant UTF8String]);
+        if ([name isEqualToString:@"gate_proj.weight"]) {
+            layout.gate_w_off = off;
+            layout.gate_s_off = off;
+            layout.gate_b_off = off;
+            layout.gate_kind = kind;
+            have_gate = 1;
+        } else if ([name isEqualToString:@"up_proj.weight"]) {
+            layout.up_w_off = off;
+            layout.up_s_off = off;
+            layout.up_b_off = off;
+            layout.up_kind = kind;
+            have_up = 1;
+        } else if ([name isEqualToString:@"down_proj.weight"]) {
+            layout.down_w_off = off;
+            layout.down_s_off = off;
+            layout.down_b_off = off;
+            layout.down_kind = kind;
+            have_down = 1;
+        }
+    }
+
+    if (!have_gate || !have_up || !have_down) return 0;
+    *layout_out = layout;
+    return 1;
+}
+
+static int load_q3_layout_manifest(const char *model_path) {
+    @autoreleasepool {
+        memset(g_q3_layer_layout_valid, 0, sizeof(g_q3_layer_layout_valid));
+        g_q3_layout_manifest_loaded = 0;
+
+        char manifest_path[1024];
+        snprintf(manifest_path, sizeof(manifest_path),
+                 "%s/packed_experts_Q3/layout.json", model_path);
+
+        NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:manifest_path]];
+        if (!data) return 0;
+
+        NSError *err = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+        if (!root || err) {
+            fprintf(stderr, "[q3] Failed to parse %s\n", manifest_path);
+            return 0;
+        }
+
+        NSNumber *num_layers_num = root[@"num_layers"];
+        NSNumber *num_experts_num = root[@"num_experts"];
+        if (num_layers_num && [num_layers_num intValue] != cfg.num_layers) {
+            fprintf(stderr, "[q3] layout.json num_layers=%d vs config %d\n",
+                    [num_layers_num intValue], cfg.num_layers);
+            return 0;
+        }
+        if (num_experts_num && [num_experts_num intValue] != cfg.num_experts) {
+            fprintf(stderr, "[q3] layout.json num_experts=%d vs config %d\n",
+                    [num_experts_num intValue], cfg.num_experts);
+            return 0;
+        }
+
+        NSDictionary *layers = root[@"layers"];
+        if ([layers isKindOfClass:[NSDictionary class]] && [layers count] > 0) {
+            for (NSString *layer_key in layers) {
+                int layer = [layer_key intValue];
+                if (layer < 0 || layer >= cfg.num_layers) continue;
+                NSDictionary *layer_info = layers[layer_key];
+                NSNumber *expert_size_num = layer_info[@"expert_size"];
+                NSArray *components = layer_info[@"components"];
+                if (!expert_size_num || !components) continue;
+                ExpertLayout layout = {0};
+                if (!parse_q3_layout_components(components, (size_t)[expert_size_num unsignedLongLongValue], &layout)) {
+                    fprintf(stderr, "[q3] Invalid components in layer %d manifest entry\n", layer);
+                    return 0;
+                }
+                g_q3_layer_layouts[layer] = layout;
+                g_q3_layer_layout_valid[layer] = 1;
+            }
+            g_q3_layout_manifest_loaded = 1;
+            return 1;
+        }
+
+        // Backward-compatible parser for the original 397B manifest shape.
+        NSNumber *expert_size_num = root[@"expert_size"];
+        NSArray *components = root[@"components"];
+        if (!expert_size_num || !components) return 0;
+
+        ExpertLayout default_layout = {0};
+        if (!parse_q3_layout_components(components, (size_t)[expert_size_num unsignedLongLongValue], &default_layout)) {
+            fprintf(stderr, "[q3] Invalid default components in %s\n", manifest_path);
+            return 0;
+        }
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            g_q3_layer_layouts[layer] = default_layout;
+            g_q3_layer_layout_valid[layer] = 1;
+        }
+
+        NSDictionary *outlier_layers = root[@"outlier_layers"];
+        if ([outlier_layers isKindOfClass:[NSDictionary class]]) {
+            for (NSString *layer_key in outlier_layers) {
+                int layer = [layer_key intValue];
+                if (layer < 0 || layer >= cfg.num_layers) continue;
+                NSDictionary *layer_info = outlier_layers[layer_key];
+                NSNumber *layer_expert_size_num = layer_info[@"expert_size"];
+                NSArray *layer_components = layer_info[@"components"];
+                if (!layer_expert_size_num || !layer_components) continue;
+                ExpertLayout outlier_layout = {0};
+                if (!parse_q3_layout_components(layer_components, (size_t)[layer_expert_size_num unsignedLongLongValue], &outlier_layout)) {
+                    fprintf(stderr, "[q3] Invalid outlier components for layer %d\n", layer);
+                    return 0;
+                }
+                g_q3_layer_layouts[layer] = outlier_layout;
+                g_q3_layer_layout_valid[layer] = 1;
+            }
+        }
+
+        g_q3_layout_manifest_loaded = 1;
+        return 1;
+    }
+}
+
+static inline size_t default_q3_expert_size(void) {
+    if (g_q3_layout_manifest_loaded) {
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (g_q3_layer_layout_valid[layer]) {
+                return g_q3_layer_layouts[layer].expert_size;
+            }
+        }
+    }
+    return g_use_q3_outlier ? EXPERT_SIZE_Q3_OUTLIER : EXPERT_SIZE_Q3_HYBRID;
+}
+
+static inline size_t max_q3_expert_size(void) {
+    size_t max_size = 0;
+    if (g_q3_layout_manifest_loaded) {
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (g_q3_layer_layout_valid[layer] && g_q3_layer_layouts[layer].expert_size > max_size) {
+                max_size = g_q3_layer_layouts[layer].expert_size;
+            }
+        }
+    }
+    return max_size ? max_size : EXPERT_SIZE_Q3_OUTLIER;
+}
+
+static inline ExpertLayout expert_layout_for_kind(ExpertQuantKind kind) {
+    switch (kind) {
+        case EXPERT_QUANT_2BIT:
+            return (ExpertLayout) {
+                .expert_size = EXPERT_SIZE_2BIT,
+                .gate_w_off = GATE_W_OFF_2, .gate_s_off = GATE_S_OFF_2, .gate_b_off = GATE_B_OFF_2,
+                .up_w_off   = UP_W_OFF_2,   .up_s_off   = UP_S_OFF_2,   .up_b_off   = UP_B_OFF_2,
+                .down_w_off = DOWN_W_OFF_2, .down_s_off = DOWN_S_OFF_2, .down_b_off = DOWN_B_OFF_2,
+                .gate_kind = EXPERT_PROJ_AFFINE,
+                .up_kind = EXPERT_PROJ_AFFINE,
+                .down_kind = EXPERT_PROJ_AFFINE,
+            };
+        case EXPERT_QUANT_Q3_HYBRID:
+            if (g_active_q3_layout_valid) return g_active_q3_layout;
+            return (ExpertLayout) {
+                .expert_size = EXPERT_SIZE_Q3_HYBRID,
+                .gate_w_off = GATE_W_OFF_Q3, .gate_s_off = GATE_W_OFF_Q3, .gate_b_off = GATE_W_OFF_Q3,
+                .up_w_off   = UP_W_OFF_Q3,   .up_s_off   = UP_W_OFF_Q3,   .up_b_off   = UP_W_OFF_Q3,
+                .down_w_off = DOWN_W_OFF_Q3, .down_s_off = DOWN_S_OFF_Q3, .down_b_off = DOWN_B_OFF_Q3,
+                .gate_kind = EXPERT_PROJ_IQ3_XXS,
+                .up_kind = EXPERT_PROJ_IQ3_XXS,
+                .down_kind = EXPERT_PROJ_IQ4_XS,
+            };
+        case EXPERT_QUANT_Q3_OUTLIER:
+            if (g_active_q3_layout_valid) return g_active_q3_layout;
+            return (ExpertLayout) {
+                .expert_size = EXPERT_SIZE_Q3_OUTLIER,
+                .gate_w_off = GATE_W_OFF_Q3_OUTLIER, .gate_s_off = GATE_W_OFF_Q3_OUTLIER, .gate_b_off = GATE_W_OFF_Q3_OUTLIER,
+                .up_w_off   = UP_W_OFF_Q3_OUTLIER,   .up_s_off   = UP_W_OFF_Q3_OUTLIER,   .up_b_off   = UP_W_OFF_Q3_OUTLIER,
+                .down_w_off = DOWN_W_OFF_Q3_OUTLIER, .down_s_off = DOWN_S_OFF_Q3_OUTLIER, .down_b_off = DOWN_B_OFF_Q3_OUTLIER,
+                .gate_kind = EXPERT_PROJ_IQ4_XS,
+                .up_kind = EXPERT_PROJ_IQ4_XS,
+                .down_kind = EXPERT_PROJ_Q5_K,
+            };
+        case EXPERT_QUANT_4BIT:
+        default:
+            return (ExpertLayout) {
+                .expert_size = EXPERT_SIZE,
+                .gate_w_off = (int)cfg.gate_w_off_4, .gate_s_off = (int)cfg.gate_s_off_4, .gate_b_off = (int)cfg.gate_b_off_4,
+                .up_w_off   = (int)cfg.up_w_off_4,   .up_s_off   = (int)cfg.up_s_off_4,   .up_b_off   = (int)cfg.up_b_off_4,
+                .down_w_off = (int)cfg.down_w_off_4,  .down_s_off = (int)cfg.down_s_off_4,  .down_b_off = (int)cfg.down_b_off_4,
+                .gate_kind = EXPERT_PROJ_AFFINE,
+                .up_kind = EXPERT_PROJ_AFFINE,
+                .down_kind = EXPERT_PROJ_AFFINE,
+            };
+    }
+}
+
+static inline const char *expert_quant_label(ExpertQuantKind kind) {
+    switch (kind) {
+        case EXPERT_QUANT_2BIT: return "2-bit";
+        case EXPERT_QUANT_Q3_HYBRID: return "Q3-GGUF";
+        case EXPERT_QUANT_Q3_OUTLIER: return "Q3-outlier";
+        case EXPERT_QUANT_4BIT:
+        default: return "4-bit";
+    }
+}
+
+static inline const char *requested_expert_quant_label(void) {
+    if (g_use_tiered) return "tiered (4/2-bit)";
+    if (g_use_q3_experts) return "Q3-GGUF";
+    if (g_use_2bit) return "2-bit";
+    return "4-bit";
+}
+
 // Active expert size based on quantization mode
 static inline size_t active_expert_size(void) {
-    return g_use_2bit ? cfg.expert_size_2bit : cfg.expert_size_4bit;
+    if ((g_use_q3_experts || g_use_q3_outlier) && g_active_q3_layout_valid) {
+        return g_active_q3_layout.expert_size;
+    }
+    if ((g_use_q3_experts || g_use_q3_outlier) && g_q3_layout_manifest_loaded) {
+        return default_q3_expert_size();
+    }
+    return expert_layout_for_kind(active_expert_quant_kind()).expert_size;
 }
 
 // Tiered-aware expert offset and size lookup
@@ -632,6 +1085,19 @@ static inline void expert_offset_size(int layer, int expert, off_t *out_offset, 
         *out_offset = (off_t)expert * esz;
         *out_size = esz;
     }
+}
+
+static inline size_t layer_expert_size(int layer) {
+    if ((g_layer_is_q3_hybrid[layer] || g_layer_is_q3_outlier[layer]) &&
+        g_q3_layout_manifest_loaded && g_q3_layer_layout_valid[layer]) {
+        return g_q3_layer_layouts[layer].expert_size;
+    }
+    return expert_layout_for_kind(layer_expert_quant_kind(layer)).expert_size;
+}
+
+static inline size_t max_expert_size_for_current_config(void) {
+    if (g_use_q3_experts) return max_q3_expert_size();
+    return EXPERT_SIZE;
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
 
@@ -1256,6 +1722,49 @@ static void cpu_dequant_matvec(
     }
 }
 
+// N-bit dequant matvec: out[out_dim] = W * x[in_dim]
+// bits = 4 or 8. W is packed uint32 (8/bits values per uint32).
+static void cpu_dequant_matvec_nbits(
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    const float *x, float *out,
+    int out_dim, int in_dim, int group_size, int bits
+) {
+    if (bits == 4) {
+        cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+        return;
+    }
+    // 8-bit: 4 values per uint32
+    int vals_per_u32 = 32 / bits;
+    int mask = (1 << bits) - 1;
+    int num_groups = in_dim / group_size;
+    int packed_per_group = group_size / vals_per_u32;
+    int packed_cols = in_dim / vals_per_u32;
+
+    for (int row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const uint32_t *w_row = W + row * packed_cols;
+        const uint16_t *s_row = scales + row * num_groups;
+        const uint16_t *b_row = biases + row * num_groups;
+
+        for (int g = 0; g < num_groups; g++) {
+            float scale = bf16_to_f32(s_row[g]);
+            float bias = bf16_to_f32(b_row[g]);
+            int base_packed = g * packed_per_group;
+            int base_x = g * group_size;
+
+            for (int p = 0; p < packed_per_group; p++) {
+                uint32_t packed = w_row[base_packed + p];
+                int x_base = base_x + p * vals_per_u32;
+                for (int n = 0; n < vals_per_u32; n++) {
+                    uint32_t val = (packed >> (n * bits)) & mask;
+                    acc += ((float)val * scale + bias) * x[x_base + n];
+                }
+            }
+        }
+        out[row] = acc;
+    }
+}
+
 // RMS normalization: out = x * w / rms(x)
 void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps) {
     float sum_sq = 0.0f;
@@ -1330,6 +1839,43 @@ static void cpu_normalize_weights(float *weights, int K) {
     if (sum > 0.0f) {
         float inv = 1.0f / sum;
         for (int k = 0; k < K; k++) weights[k] *= inv;
+    }
+}
+
+// Unified expert routing: handles both softmax (Qwen) and sigmoid (MiniMax).
+// gate_scores[num_experts] is the raw router output (MODIFIED in place).
+// routing_bias may be NULL (Qwen) or [num_experts] correction bias (MiniMax).
+// On return: expert_indices[K] and expert_weights[K] are populated and normalized.
+static void cpu_route_experts(float *gate_scores, int num_experts, int K,
+                              const float *routing_bias,
+                              int *expert_indices, float *expert_weights) {
+    if (cfg.scoring_func == 1) {
+        // Sigmoid routing (MiniMax): sigmoid → bias-corrected top-K → normalize original scores
+        for (int i = 0; i < num_experts; i++)
+            gate_scores[i] = 1.0f / (1.0f + expf(-gate_scores[i]));
+
+        if (routing_bias) {
+            // Top-K on bias-corrected scores, but extract original sigmoid weights
+            float biased[num_experts];
+            for (int i = 0; i < num_experts; i++)
+                biased[i] = gate_scores[i] + routing_bias[i];
+            cpu_topk(biased, num_experts, K, expert_indices, expert_weights);
+            // Replace biased weights with original sigmoid scores
+            for (int k = 0; k < K; k++)
+                expert_weights[k] = gate_scores[expert_indices[k]];
+        } else {
+            cpu_topk(gate_scores, num_experts, K, expert_indices, expert_weights);
+        }
+        // Normalize: scores / (sum + eps)
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) sum += expert_weights[k];
+        float inv = 1.0f / (sum + 1e-20f);
+        for (int k = 0; k < K; k++) expert_weights[k] *= inv;
+    } else {
+        // Softmax routing (Qwen): softmax → top-K → normalize
+        cpu_softmax(gate_scores, num_experts);
+        cpu_topk(gate_scores, num_experts, K, expert_indices, expert_weights);
+        cpu_normalize_weights(expert_weights, K);
     }
 }
 
@@ -1427,6 +1973,31 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
+    id<MTLComputePipelineState> matvec_iq3_xxs; // GGUF IQ3_XXS streamed expert kernel
+    id<MTLComputePipelineState> matvec_iq4_xs; // GGUF IQ4_XS streamed expert kernel
+    id<MTLComputePipelineState> matvec_q5_k; // GGUF Q5_K streamed expert kernel
+    id<MTLComputePipelineState> matvec_q8_0;  // GGUF Q8_0 resident tensor path
+    id<MTLComputePipelineState> matvec_q6_k;  // GGUF Q6_K resident tensor path
+    // NAX (Metal 4 / M5+) pipelines
+    id<MTLLibrary>              nax_library;   // compiled with Metal 4.0 (NULL if not available)
+    id<MTLComputePipelineState> nax_dequant;   // 4-bit → half dequant kernel
+    id<MTLComputePipelineState> nax_f32_to_half; // float32 → half conversion
+    id<MTLComputePipelineState> nax_gemm;      // NAX tensor matmul2d
+    id<MTLComputePipelineState> nax_extract;   // extract row 0 from column-major output
+    id<MTLComputePipelineState> nax_transpose; // column-major → row-major transpose
+    id<MTLBuffer>               nax_w_half;    // dequantized weight buffer (half)
+    id<MTLBuffer>               nax_x_half;    // input converted to half (padded to 32 rows)
+    id<MTLBuffer>               nax_c_buf;     // padded output buffer [32, VOCAB_SIZE]
+    // Per-projection NAX weight caches for batched prefill (dequantized to half, cached)
+    id<MTLBuffer>               nax_pfb_w_cache[8]; // cached dequantized weights per projection slot
+    int                         nax_pfb_w_valid[8]; // 1 if the cached weights are valid for this layer
+    int                         nax_pfb_cached_layer; // layer index whose weights are cached (-1 = none)
+    int                         has_nax;       // 1 if NAX hardware available
+    // Batched prefill GEMM
+    id<MTLComputePipelineState> gemm_batch;    // dequant_gemm_4bit_batch kernel
+    id<MTLBuffer>               buf_pfb_input; // [MAX_PFB * HIDDEN_DIM floats] batched input
+    id<MTLBuffer>               buf_pfb_out[8];// [MAX_PFB * max_proj_dim floats] per projection slot
+
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -1437,6 +2008,14 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v3_fp16;
     id<MTLComputePipelineState> matvec_2bit_fp16;
     id<MTLComputePipelineState> fused_gate_up_fp16;
+    // Prefill kernels
+    id<MTLComputePipelineState> prefill_causal_attn;
+    id<MTLComputePipelineState> prefill_rms_norm;
+    id<MTLComputePipelineState> prefill_residual_norm;
+    id<MTLComputePipelineState> prefill_swiglu;
+    id<MTLComputePipelineState> prefill_combine;
+    id<MTLComputePipelineState> prefill_q_rope_norm;
+    id<MTLComputePipelineState> prefill_kv_cache;
     // GPU attention pipelines
     id<MTLComputePipelineState> attn_scores_pipe;
     id<MTLComputePipelineState> attn_softmax_pipe;
@@ -1521,10 +2100,15 @@ typedef struct {
     // GPU delta-net (gated_delta_net_step) and conv1d pipelines
     id<MTLComputePipelineState> delta_net_step;  // gated_delta_net_step kernel
     id<MTLComputePipelineState> delta_net_step_fused;  // pass 2+3 merged (saves ~1M reads/token)
+    id<MTLComputePipelineState> delta_net_step_batched;  // prefill chunked gated-delta kernel
     id<MTLComputePipelineState> conv1d_step;     // conv1d_step kernel
+    id<MTLComputePipelineState> conv1d_step_batched;     // prefill chunked conv1d kernel
     id<MTLComputePipelineState> rms_norm_qk;     // per-head RMS normalize for q and k
+    id<MTLComputePipelineState> rms_norm_qk_batched;     // batched per-head RMS normalize
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
+    id<MTLComputePipelineState> compute_decay_beta_batched; // batched g_decay and beta_gate
     id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
+    id<MTLComputePipelineState> gated_rms_norm_batched;  // batched z-gated output normalization
     // Persistent GPU state buffers for linear attention layers
     id<MTLBuffer> __strong *buf_delta_state;   // [v_heads*v_dim*k_dim] float per layer
     id<MTLBuffer> __strong *buf_conv_state;     // [(kernel-1)*conv_dim] float per layer
@@ -1612,6 +2196,14 @@ MetalCtx *metal_setup(void) {
         return ps;
     };
 
+    ctx->gemm_batch    = makePipe(@"dequant_gemm_4bit_batch");
+    ctx->prefill_causal_attn = makePipe(@"prefill_causal_attn");
+    ctx->prefill_rms_norm    = makePipe(@"prefill_rms_norm_bf16");
+    ctx->prefill_residual_norm = makePipe(@"prefill_residual_norm_bf16");
+    ctx->prefill_swiglu      = makePipe(@"prefill_swiglu");
+    ctx->prefill_combine     = makePipe(@"prefill_combine");
+    ctx->prefill_q_rope_norm = makePipe(@"prefill_q_rope_norm_bf16");
+    ctx->prefill_kv_cache    = makePipe(@"prefill_kv_cache_bf16");
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
@@ -1666,17 +2258,81 @@ MetalCtx *metal_setup(void) {
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->delta_net_step_fused = makePipe(@"gated_delta_net_step_fused");
+    ctx->delta_net_step_batched = makePipe(@"gated_delta_net_step_batched");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
+    ctx->conv1d_step_batched = makePipe(@"conv1d_step_batched");
     ctx->rms_norm_qk       = makePipe(@"rms_norm_qk");
+    ctx->rms_norm_qk_batched = makePipe(@"rms_norm_qk_batched");
     ctx->compute_decay_beta = makePipe(@"compute_decay_beta");
+    ctx->compute_decay_beta_batched = makePipe(@"compute_decay_beta_batched");
     ctx->gated_rms_norm    = makePipe(@"gated_rms_norm");
+    ctx->gated_rms_norm_batched = makePipe(@"gated_rms_norm_batched");
     if (!ctx->moe_combine_residual) fprintf(stderr, "[metal] WARNING: moe_combine_residual pipeline failed\n");
     if (!ctx->delta_net_step_fused) fprintf(stderr, "[metal] WARNING: gated_delta_net_step_fused pipeline failed (using unfused fallback)\n");
+    if (!ctx->prefill_q_rope_norm) fprintf(stderr, "[metal] WARNING: prefill_q_rope_norm_bf16 pipeline failed (prefill fallback)\n");
+    if (!ctx->prefill_kv_cache) fprintf(stderr, "[metal] WARNING: prefill_kv_cache_bf16 pipeline failed (prefill fallback)\n");
     if (!ctx->delta_net_step) fprintf(stderr, "[metal] WARNING: gated_delta_net_step pipeline failed (CPU fallback)\n");
+    if (!ctx->delta_net_step_batched) fprintf(stderr, "[metal] WARNING: gated_delta_net_step_batched pipeline failed (prefill fallback)\n");
     if (!ctx->conv1d_step)    fprintf(stderr, "[metal] WARNING: conv1d_step pipeline failed (CPU fallback)\n");
+    if (!ctx->conv1d_step_batched) fprintf(stderr, "[metal] WARNING: conv1d_step_batched pipeline failed (prefill fallback)\n");
     if (!ctx->rms_norm_qk)       fprintf(stderr, "[metal] WARNING: rms_norm_qk pipeline failed (CPU fallback)\n");
+    if (!ctx->rms_norm_qk_batched) fprintf(stderr, "[metal] WARNING: rms_norm_qk_batched pipeline failed (prefill fallback)\n");
     if (!ctx->compute_decay_beta) fprintf(stderr, "[metal] WARNING: compute_decay_beta pipeline failed (CPU fallback)\n");
+    if (!ctx->compute_decay_beta_batched) fprintf(stderr, "[metal] WARNING: compute_decay_beta_batched pipeline failed (prefill fallback)\n");
     if (!ctx->gated_rms_norm)     fprintf(stderr, "[metal] WARNING: gated_rms_norm pipeline failed (CPU fallback)\n");
+    if (!ctx->gated_rms_norm_batched) fprintf(stderr, "[metal] WARNING: gated_rms_norm_batched pipeline failed (prefill fallback)\n");
+
+    // ---- NAX (Metal 4 / M5+) ----
+    ctx->has_nax = 0;
+    if (@available(macOS 26.2, *)) {
+        if ([ctx->device supportsFamily:(MTLGPUFamily)5002]) {
+            // Try compiling NAX shaders with Metal 4.0
+            NSArray *nax_paths = @[@"nax_gemm.metal", @"metal_infer/nax_gemm.metal"];
+            NSString *nax_src = nil;
+            for (NSString *p in nax_paths) {
+                nax_src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
+                if (nax_src) break;
+            }
+            if (nax_src) {
+                MTLCompileOptions *nax_opts = [[MTLCompileOptions alloc] init];
+                nax_opts.languageVersion = (MTLLanguageVersion)0x40000;  // Metal 4.0
+                nax_opts.mathMode = MTLMathModeFast;
+                ctx->nax_library = [ctx->device newLibraryWithSource:nax_src options:nax_opts error:&error];
+                if (ctx->nax_library) {
+                    id<MTLComputePipelineState> (^naxPipe)(NSString *) = ^(NSString *name) {
+                        id<MTLFunction> fn = [ctx->nax_library newFunctionWithName:name];
+                        if (!fn) return (id<MTLComputePipelineState>)nil;
+                        NSError *e2 = nil;
+                        return [ctx->device newComputePipelineStateWithFunction:fn error:&e2];
+                    };
+                    ctx->nax_dequant = naxPipe(@"nax_dequant_4bit");
+                    ctx->nax_f32_to_half = naxPipe(@"nax_f32_to_half");
+                    ctx->nax_gemm = naxPipe(@"nax_gemm_f32_input");
+                    ctx->nax_extract = naxPipe(@"nax_extract_row0");
+                    ctx->nax_transpose = naxPipe(@"nax_transpose_cm_to_rm");
+                    if (ctx->nax_dequant && ctx->nax_gemm && ctx->nax_f32_to_half) {
+                        ctx->has_nax = 1;
+                        // Pre-allocate buffers for LM head (largest projection: vocab_size × hidden_dim)
+                        // M is padded to 32 for NAX tile alignment
+                        ctx->nax_w_half = [ctx->device newBufferWithLength:(size_t)cfg.vocab_size * cfg.hidden_dim * sizeof(uint16_t)
+                                                                   options:MTLResourceStorageModeShared];
+                        ctx->nax_x_half = [ctx->device newBufferWithLength:(size_t)32 * cfg.hidden_dim * sizeof(uint16_t)
+                                                                   options:MTLResourceStorageModeShared];
+                        ctx->nax_c_buf = [ctx->device newBufferWithLength:(size_t)32 * cfg.vocab_size * sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+                        // Initialize batched prefill NAX weight cache state
+                        ctx->nax_pfb_cached_layer = -1;
+                        memset(ctx->nax_pfb_w_valid, 0, sizeof(ctx->nax_pfb_w_valid));
+                        memset(ctx->nax_pfb_w_cache, 0, sizeof(ctx->nax_pfb_w_cache));
+                        printf("[metal] NAX (Metal 4) enabled — tensor matmul for LM head + batched prefill\n");
+                    }
+                }
+            }
+            if (!ctx->has_nax) {
+                printf("[metal] NAX shader compile failed, using standard kernels\n");
+            }
+        }
+    }
 
     if (!ctx->matvec_v3 || !ctx->matvec_fast) {
         fprintf(stderr, "ERROR: Required Metal pipeline missing\n");
@@ -1842,6 +2498,29 @@ MetalCtx *metal_setup(void) {
     // Create shared event for CPU-GPU async pipeline
     ctx->pipeline_event = [ctx->device newSharedEvent];
     ctx->event_value = 0;
+
+    // ---- Prefill batch buffers ----
+    if (g_prefill_batch > 1 && ctx->gemm_batch) {
+        size_t pfb = g_prefill_batch;
+        // Input buffer: N × hidden_dim floats
+        ctx->buf_pfb_input = [ctx->device newBufferWithLength:pfb * MAX_HIDDEN_DIM * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        // Output slots for projections (largest = QKV at 12288 or Q at 16384)
+        size_t max_proj = 16384;  // NUM_ATTN_HEADS * HEAD_DIM * 2 for full attn Q
+        for (int i = 0; i < 8; i++) {
+            ctx->buf_pfb_out[i] = [ctx->device newBufferWithLength:pfb * max_proj * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+        }
+        printf("[metal] Prefill batch buffers allocated (pfb=%d, %.1f MB)\n",
+               (int)pfb, (pfb * MAX_HIDDEN_DIM + pfb * max_proj * 8) * sizeof(float) / 1e6);
+        if (g_prefill_batch > 1) {
+            printf("[metal] Prefill config: batch=%d, skip_experts=%d, batched_linear=%d\n",
+                   g_prefill_batch, effective_prefill_skip_experts(), !g_disable_batched_linear);
+        }
+        if (g_prefill_batch > MAX_PFB_GPU) {
+            printf("[metal] Prefill GPU chunk size capped at %d tokens per dispatch\n", MAX_PFB_GPU);
+        }
+    }
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
     return ctx;
@@ -2061,6 +2740,106 @@ static void gpu_dequant_matvec(
     memcpy(out_f32, [o_buf contents], o_size);
 }
 
+// Track whether LM head weights have been dequantized to nax_w_half
+static int g_nax_lmhead_dequantized = 0;
+
+// NAX 2-pass dispatch: dequant weights to half (cached), convert input to half, then NAX GEMM
+// Only used for large projections (LM head) where NAX provides significant speedup
+static void gpu_nax_dequant_gemm(
+    MetalCtx *ctx,
+    const void *W_packed, const void *scales, const void *biases,
+    const float *x_f32, float *out_f32,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size
+) {
+    uint32_t num_groups = in_dim / group_size;
+    NSUInteger w_off = (NSUInteger)((const char *)W_packed - (const char *)[ctx->wf_buf contents]);
+    NSUInteger s_off = (NSUInteger)((const char *)scales   - (const char *)[ctx->wf_buf contents]);
+    NSUInteger b_off = (NSUInteger)((const char *)biases   - (const char *)[ctx->wf_buf contents]);
+
+    // Pad M to NAX tile size (32) to avoid cooperative tensor store overflow
+    const uint32_t NAX_BM = 32;
+    uint32_t M_padded = NAX_BM;  // always pad to at least one full tile
+
+    // Ensure NAX buffers are large enough
+    size_t w_half_size = (size_t)out_dim * in_dim * sizeof(uint16_t);
+    if ([ctx->nax_w_half length] < w_half_size) {
+        ctx->nax_w_half = [ctx->device newBufferWithLength:w_half_size options:MTLResourceStorageModeShared];
+    }
+    size_t x_half_size = (size_t)M_padded * in_dim * sizeof(uint16_t);
+    if ([ctx->nax_x_half length] < x_half_size) {
+        ctx->nax_x_half = [ctx->device newBufferWithLength:x_half_size options:MTLResourceStorageModeShared];
+    }
+
+    // Copy input to buf_input (only 1 row of actual data, zero-pad rest for M_padded=32)
+    size_t input_padded_size = (size_t)M_padded * in_dim * sizeof(float);
+    if ([ctx->buf_input length] < input_padded_size) {
+        ctx->buf_input = [ctx->device newBufferWithLength:input_padded_size options:MTLResourceStorageModeShared];
+    }
+    memcpy([ctx->buf_input contents], x_f32, in_dim * sizeof(float));
+    memset((char *)[ctx->buf_input contents] + in_dim * sizeof(float), 0,
+           (M_padded - 1) * in_dim * sizeof(float));
+
+    // Pass 1: Dequantize 4-bit weights → half (cached after first call)
+    if (!g_nax_lmhead_dequantized) {
+        id<MTLCommandBuffer> deq_cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [deq_cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->nax_dequant];
+        [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+        [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+        [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
+        [enc setBuffer:ctx->nax_w_half offset:0    atIndex:3];
+        [enc setBytes:&out_dim length:4 atIndex:4];
+        [enc setBytes:&in_dim  length:4 atIndex:5];
+        uint32_t total_groups = out_dim * num_groups;
+        uint32_t tg_size = 256;
+        uint32_t num_tgs = (total_groups + tg_size - 1) / tg_size;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [enc endEncoding];
+        [deq_cmd commit]; [deq_cmd waitUntilCompleted];
+        g_nax_lmhead_dequantized = 1;
+        fprintf(stderr, "[nax] LM head weights dequantized to half (cached, %.1f MB)\n",
+                (double)out_dim * in_dim * 2 / 1e6);
+    }
+
+    // NAX GEMM: C[M_padded, N] = x_f32[M_padded, K] @ W_half[N, K]^T
+    // nax_gemm_f32_input converts f32→half inline (no separate pass)
+    id<MTLBuffer> c_buf = ctx->nax_c_buf;
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->nax_gemm];
+    [enc setBuffer:ctx->buf_input  offset:0 atIndex:0];  // A[M_padded, K] float32
+    [enc setBuffer:ctx->nax_w_half offset:0 atIndex:1];  // B[N, K] half (cached)
+    [enc setBuffer:c_buf           offset:0 atIndex:2];  // C[M_padded, N] float32
+    [enc setBytes:&M_padded length:4 atIndex:3];
+    [enc setBytes:&out_dim  length:4 atIndex:4];
+    [enc setBytes:&in_dim   length:4 atIndex:5];
+    int gx = (out_dim + 31) / 32;
+    int gy = (M_padded + 31) / 32;
+    [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+
+    // Extract row 0 from column-major output on GPU (avoids slow strided CPU readback)
+    {
+        id<MTLComputeCommandEncoder> enc2 = [cmdbuf computeCommandEncoder];
+        [enc2 setComputePipelineState:ctx->nax_extract];
+        [enc2 setBuffer:c_buf          offset:0 atIndex:0];  // column-major input
+        [enc2 setBuffer:ctx->buf_output offset:0 atIndex:1]; // row-major output
+        [enc2 setBytes:&out_dim  length:4 atIndex:2];
+        [enc2 setBytes:&M_padded length:4 atIndex:3];
+        [enc2 dispatchThreads:MTLSizeMake(out_dim, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(out_dim, (uint32_t)1024), 1, 1)];
+        [enc2 endEncoding];
+    }
+
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(out_f32, [ctx->buf_output contents], out_dim * sizeof(float));
+}
+
 // Wrapper: use GPU if available and weight buffer is set, CPU otherwise
 static void fast_dequant_matvec(
     const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
@@ -2069,18 +2848,27 @@ static void fast_dequant_matvec(
 ) {
     int use_gpu = g_metal && (g_metal->wf_num_chunks > 0 || g_metal->wf_staging);
     if (use_gpu) {
-        // In staging mode, check if tensors fit in staging buffer.
-        // LM head (~500MB) won't fit — fall back to CPU for that.
-        size_t w_size = (size_t)out_dim * in_dim / 8;
-        size_t num_groups = ((unsigned)in_dim + group_size - 1) / group_size;
-        size_t sb_size = (size_t)out_dim * num_groups * sizeof(uint16_t);
-        size_t total = w_size + sb_size + sb_size;
-        if (g_metal->wf_staging && g_metal->wf_num_chunks == 0 && total > WF_STAGING_SIZE) {
-            cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
-            return;
+        // Use NAX for LM head only (248K × hidden) — largest projection
+        // WARNING: NAX with M=1 (single-token decode) is SLOWER than FMA due to 32×32 tile
+        // padding overhead (31/32 of tile wasted). Only beneficial for batched decode (M≥4).
+        // The --nax flag enables this path for benchmarking; not recommended for production M=1.
+        if (g_metal->has_nax && !g_nax_disabled && out_dim > 100000) {
+            gpu_nax_dequant_gemm(g_metal, W, scales, biases, x, out,
+                                 (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
+        } else {
+            // In staging mode, check if tensors fit in staging buffer.
+            // LM head (~500MB) won't fit — fall back to CPU for that.
+            size_t w_size = (size_t)out_dim * in_dim / 8;
+            size_t num_groups = ((unsigned)in_dim + group_size - 1) / group_size;
+            size_t sb_size = (size_t)out_dim * num_groups * sizeof(uint16_t);
+            size_t total = w_size + sb_size + sb_size;
+            if (g_metal->wf_staging && g_metal->wf_num_chunks == 0 && total > WF_STAGING_SIZE) {
+                cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+                return;
+            }
+            gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
+                               (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
         }
-        gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
-                           (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
     } else {
         cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
     }
@@ -2232,6 +3020,165 @@ static void gpu_encode_batch_matvec(
         }
         [enc endEncoding];
     }
+}
+
+// Encode a batched GEMM using FMA kernel: project N tokens through one 4-bit weight matrix.
+// Input: in_buf [N * in_dim floats], Output: out_buf [N * out_dim floats]
+// Weight is 4-bit packed in wf_buf.
+static void gpu_encode_pfb_gemm_fma(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size,
+    int batch_n,
+    id<MTLBuffer> in_buf, NSUInteger in_offset,
+    id<MTLBuffer> out_buf, NSUInteger out_offset
+) {
+    if (!ctx->gemm_batch || !ctx->wf_buf) return;
+    NSUInteger w_off = (NSUInteger)((const char *)W      - (const char *)[ctx->wf_buf contents]);
+    NSUInteger s_off = (NSUInteger)((const char *)scales  - (const char *)[ctx->wf_buf contents]);
+    NSUInteger b_off = (NSUInteger)((const char *)biases  - (const char *)[ctx->wf_buf contents]);
+    uint32_t bn = (uint32_t)batch_n;
+
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->gemm_batch];
+    [enc setBuffer:ctx->wf_buf offset:w_off     atIndex:0];
+    [enc setBuffer:ctx->wf_buf offset:s_off     atIndex:1];
+    [enc setBuffer:ctx->wf_buf offset:b_off     atIndex:2];
+    [enc setBuffer:in_buf      offset:in_offset atIndex:3];
+    [enc setBuffer:out_buf     offset:out_offset atIndex:4];
+    [enc setBytes:&out_dim    length:4 atIndex:5];
+    [enc setBytes:&in_dim     length:4 atIndex:6];
+    [enc setBytes:&group_size length:4 atIndex:7];
+    [enc setBytes:&bn         length:4 atIndex:8];
+    uint32_t num_tgs = (out_dim + 7) / 8;
+    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+}
+
+// NAX batched prefill GEMM: dequant weights → half, NAX GEMM M=batch_n, transpose output.
+// Encodes into an existing command buffer (no commit/wait — caller manages that).
+// Weight dequant runs every dispatch (not cached across projections, unlike LM head).
+static void gpu_encode_pfb_nax_gemm_ex(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size,
+    int batch_n,
+    id<MTLBuffer> in_buf, NSUInteger in_offset,
+    id<MTLBuffer> out_buf, NSUInteger out_offset
+) {
+    if (!ctx->has_nax || !ctx->nax_gemm || !ctx->nax_dequant || !ctx->nax_transpose || !ctx->wf_buf) return;
+
+    NSUInteger w_off = (NSUInteger)((const char *)W      - (const char *)[ctx->wf_buf contents]);
+    NSUInteger s_off = (NSUInteger)((const char *)scales  - (const char *)[ctx->wf_buf contents]);
+    NSUInteger b_off = (NSUInteger)((const char *)biases  - (const char *)[ctx->wf_buf contents]);
+    uint32_t num_groups = in_dim / group_size;
+
+    // Pad M to NAX tile size (32)
+    const uint32_t NAX_BM = 32;
+    uint32_t M_padded = ((uint32_t)batch_n + NAX_BM - 1) & ~(NAX_BM - 1);
+    if (M_padded < NAX_BM) M_padded = NAX_BM;
+
+    // Ensure nax_w_half is large enough for this projection's weights
+    size_t w_half_size = (size_t)out_dim * in_dim * sizeof(uint16_t);
+    if ([ctx->nax_w_half length] < w_half_size) {
+        ctx->nax_w_half = [ctx->device newBufferWithLength:w_half_size options:MTLResourceStorageModeShared];
+    }
+
+    // Ensure nax_c_buf is large enough for padded output [M_padded, out_dim]
+    size_t c_size = (size_t)M_padded * out_dim * sizeof(float);
+    if ([ctx->nax_c_buf length] < c_size) {
+        ctx->nax_c_buf = [ctx->device newBufferWithLength:c_size options:MTLResourceStorageModeShared];
+    }
+
+    // Zero-pad input if M_padded > batch_n: we rely on in_buf having valid data for batch_n rows
+    // and the NAX kernel's bounds checking handles out-of-range M indices (loads 0.0f).
+
+    // Pass 1: Dequantize 4-bit weights → half
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:ctx->nax_dequant];
+        [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+        [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+        [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
+        [enc setBuffer:ctx->nax_w_half offset:0    atIndex:3];
+        [enc setBytes:&out_dim length:4 atIndex:4];
+        [enc setBytes:&in_dim  length:4 atIndex:5];
+        uint32_t total_groups = out_dim * num_groups;
+        uint32_t tg_size = 256;
+        uint32_t num_tgs = (total_groups + tg_size - 1) / tg_size;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [enc endEncoding];
+    }
+
+    // Pass 2: NAX GEMM — C[M_padded, out_dim] = X[M_padded, in_dim] @ W_half[out_dim, in_dim]^T
+    // nax_gemm_f32_input converts f32→half inline in threadgroup memory
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:ctx->nax_gemm];
+        [enc setBuffer:in_buf         offset:in_offset atIndex:0];  // A[M, K] float32
+        [enc setBuffer:ctx->nax_w_half offset:0        atIndex:1];  // B[N, K] half
+        [enc setBuffer:ctx->nax_c_buf  offset:0        atIndex:2];  // C[M_padded, N] float32 column-major
+        [enc setBytes:&M_padded length:4 atIndex:3];
+        [enc setBytes:&out_dim  length:4 atIndex:4];
+        [enc setBytes:&in_dim   length:4 atIndex:5];
+        int gx = (out_dim + 31) / 32;
+        int gy = (M_padded + 31) / 32;
+        [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding];
+    }
+
+    // Pass 3: Transpose column-major → row-major into output buffer
+    {
+        uint32_t M_actual = (uint32_t)batch_n;
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:ctx->nax_transpose];
+        [enc setBuffer:ctx->nax_c_buf offset:0          atIndex:0];  // column-major input
+        [enc setBuffer:out_buf        offset:out_offset  atIndex:1];  // row-major output
+        [enc setBytes:&M_actual length:4 atIndex:2];
+        [enc setBytes:&out_dim  length:4 atIndex:3];
+        [enc setBytes:&M_padded length:4 atIndex:4];
+        // 2D dispatch: threads_x = N, threads_y = M
+        MTLSize grid = MTLSizeMake(((out_dim + 15) / 16) * 16, ((M_actual + 15) / 16) * 16, 1);
+        MTLSize tg = MTLSizeMake(16, 16, 1);
+        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc endEncoding];
+    }
+}
+
+// Auto-selecting wrapper: FMA for batched prefill projections (dequant-on-the-fly, single pass),
+// NAX for LM head only (large out_dim, cached dequant). NAX loses on small projections due to
+// 3-pass overhead (dequant→GEMM→transpose) vs FMA's fused single-pass.
+static void gpu_encode_pfb_gemm_ex(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size,
+    int batch_n,
+    id<MTLBuffer> in_buf, NSUInteger in_offset,
+    id<MTLBuffer> out_buf, NSUInteger out_offset
+) {
+    gpu_encode_pfb_gemm_fma(ctx, cmdbuf, W, scales, biases,
+                             out_dim, in_dim, group_size, batch_n,
+                             in_buf, in_offset, out_buf, out_offset);
+}
+
+// Convenience: uses buf_pfb_input as input, buf_pfb_out[slot] as output
+static void gpu_encode_pfb_gemm(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size,
+    int batch_n, int out_slot
+) {
+    gpu_encode_pfb_gemm_ex(ctx, cmdbuf, W, scales, biases,
+                           out_dim, in_dim, group_size, batch_n,
+                           ctx->buf_pfb_input, 0,
+                           ctx->buf_pfb_out[out_slot], 0);
 }
 
 // Copy batch results from GPU buffers back to CPU pointers.
@@ -3191,11 +4138,11 @@ static void full_attention_forward(
     }
 
     // ---- QKV Projection ----
-    // CRITICAL: Q projection outputs num_heads * head_dim * 2 = 16384
-    // The second half is a sigmoid gate applied after attention
-    int q_proj_dim = cfg.num_attn_heads * cfg.head_dim * 2;  // 32 * 256 * 2 = 16384
-    int q_dim = cfg.num_attn_heads * cfg.head_dim;            // 32 * 256 = 8192
-    int kv_dim = cfg.num_kv_heads * cfg.head_dim;             // 2 * 256 = 512
+    // Qwen: Q projection outputs num_heads * head_dim * 2 (queries + sigmoid gate)
+    // MiniMax: Q projection outputs num_heads * head_dim (queries only, no gate)
+    int q_dim = cfg.num_attn_heads * cfg.head_dim;
+    int q_proj_dim = cfg.has_attn_gate ? q_dim * 2 : q_dim;
+    int kv_dim = cfg.num_kv_heads * cfg.head_dim;
 
     float *q_proj_out = calloc(q_proj_dim, sizeof(float));
     float *k = calloc(kv_dim, sizeof(float));
@@ -3238,26 +4185,33 @@ static void full_attention_forward(
                 q_proj_out[0], q_proj_out[1], q_proj_out[2], q_proj_out[3], q_proj_out[4]);
     }
 
-    // Split q_proj_out into queries and gate
+    // Split q_proj_out into queries and gate (Qwen only)
     float *q = calloc(q_dim, sizeof(float));
-    float *q_gate = calloc(q_dim, sizeof(float));
-    for (int h = 0; h < cfg.num_attn_heads; h++) {
-        float *src = q_proj_out + h * (2 * cfg.head_dim);
-        memcpy(q + h * cfg.head_dim, src, cfg.head_dim * sizeof(float));
-        memcpy(q_gate + h * cfg.head_dim, src + cfg.head_dim, cfg.head_dim * sizeof(float));
+    float *q_gate = NULL;
+    if (cfg.has_attn_gate) {
+        q_gate = calloc(q_dim, sizeof(float));
+        for (int h = 0; h < cfg.num_attn_heads; h++) {
+            float *src = q_proj_out + h * (2 * cfg.head_dim);
+            memcpy(q + h * cfg.head_dim, src, cfg.head_dim * sizeof(float));
+            memcpy(q_gate + h * cfg.head_dim, src + cfg.head_dim, cfg.head_dim * sizeof(float));
+        }
+    } else {
+        memcpy(q, q_proj_out, q_dim * sizeof(float));
     }
     free(q_proj_out);
 
     if (do_debug) {
         fprintf(stderr, "[FA-DBG] v_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
                 vec_rms(v, kv_dim), v[0], v[1], v[2], v[3], v[4]);
-        fprintf(stderr, "[FA-DBG] q_gate_rms=%.6f gate_first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                vec_rms(q_gate, q_dim), q_gate[0], q_gate[1], q_gate[2], q_gate[3], q_gate[4]);
-        float gate_sigmoid_sum = 0.0f;
-        for (int i = 0; i < q_dim; i++) {
-            gate_sigmoid_sum += 1.0f / (1.0f + expf(-q_gate[i]));
+        if (q_gate) {
+            fprintf(stderr, "[FA-DBG] q_gate_rms=%.6f gate_first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                    vec_rms(q_gate, q_dim), q_gate[0], q_gate[1], q_gate[2], q_gate[3], q_gate[4]);
+            float gate_sigmoid_sum = 0.0f;
+            for (int i = 0; i < q_dim; i++) {
+                gate_sigmoid_sum += 1.0f / (1.0f + expf(-q_gate[i]));
+            }
+            fprintf(stderr, "[FA-DBG] gate_sigmoid_mean=%.6f\n", gate_sigmoid_sum / q_dim);
         }
-        fprintf(stderr, "[FA-DBG] gate_sigmoid_mean=%.6f\n", gate_sigmoid_sum / q_dim);
     }
 
     // ---- Q/K RMSNorm ----
@@ -3266,27 +4220,42 @@ static void full_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", layer_idx);
     uint16_t *knorm_w = get_tensor_ptr(wf, name);
 
-    // Apply per-head Q norm
+    // Apply Q norm
     if (qnorm_w) {
-        for (int h = 0; h < cfg.num_attn_heads; h++) {
-            float *qh = q + h * cfg.head_dim;
+        if (cfg.qk_norm_per_layer) {
+            // MiniMax: RMSNorm over entire flat q vector [num_heads * head_dim]
             float sum_sq = 0.0f;
-            for (int i = 0; i < cfg.head_dim; i++) sum_sq += qh[i] * qh[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / cfg.head_dim + cfg.rms_norm_eps);
-            for (int i = 0; i < cfg.head_dim; i++) {
-                qh[i] = qh[i] * inv_rms * bf16_to_f32(qnorm_w[i]);
+            for (int i = 0; i < q_dim; i++) sum_sq += q[i] * q[i];
+            float inv_rms = 1.0f / sqrtf(sum_sq / q_dim + cfg.rms_norm_eps);
+            for (int i = 0; i < q_dim; i++) q[i] = q[i] * inv_rms * bf16_to_f32(qnorm_w[i]);
+        } else {
+            // Qwen: RMSNorm per head, weight is [head_dim] shared across heads
+            for (int h = 0; h < cfg.num_attn_heads; h++) {
+                float *qh = q + h * cfg.head_dim;
+                float sum_sq = 0.0f;
+                for (int i = 0; i < cfg.head_dim; i++) sum_sq += qh[i] * qh[i];
+                float inv_rms = 1.0f / sqrtf(sum_sq / cfg.head_dim + cfg.rms_norm_eps);
+                for (int i = 0; i < cfg.head_dim; i++) qh[i] = qh[i] * inv_rms * bf16_to_f32(qnorm_w[i]);
             }
         }
     }
-    // Apply per-head K norm
+    // Apply K norm
     if (knorm_w) {
-        for (int h = 0; h < cfg.num_kv_heads; h++) {
-            float *kh = k + h * cfg.head_dim;
+        if (cfg.qk_norm_per_layer) {
+            // MiniMax: RMSNorm over entire flat k vector
+            int kv_dim_local = cfg.num_kv_heads * cfg.head_dim;
             float sum_sq = 0.0f;
-            for (int i = 0; i < cfg.head_dim; i++) sum_sq += kh[i] * kh[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / cfg.head_dim + cfg.rms_norm_eps);
-            for (int i = 0; i < cfg.head_dim; i++) {
-                kh[i] = kh[i] * inv_rms * bf16_to_f32(knorm_w[i]);
+            for (int i = 0; i < kv_dim_local; i++) sum_sq += k[i] * k[i];
+            float inv_rms = 1.0f / sqrtf(sum_sq / kv_dim_local + cfg.rms_norm_eps);
+            for (int i = 0; i < kv_dim_local; i++) k[i] = k[i] * inv_rms * bf16_to_f32(knorm_w[i]);
+        } else {
+            // Qwen: RMSNorm per head
+            for (int h = 0; h < cfg.num_kv_heads; h++) {
+                float *kh = k + h * cfg.head_dim;
+                float sum_sq = 0.0f;
+                for (int i = 0; i < cfg.head_dim; i++) sum_sq += kh[i] * kh[i];
+                float inv_rms = 1.0f / sqrtf(sum_sq / cfg.head_dim + cfg.rms_norm_eps);
+                for (int i = 0; i < cfg.head_dim; i++) kh[i] = kh[i] * inv_rms * bf16_to_f32(knorm_w[i]);
             }
         }
     }
@@ -3419,12 +4388,13 @@ static void full_attention_forward(
     free(v_dequant);
 
 
-    // ---- Apply sigmoid gate to attention output ----
+    // ---- Apply sigmoid gate to attention output (Qwen only) ----
     // MLX: return self.o_proj(output * mx.sigmoid(gate))
-    // gate is reshaped to [B, L, num_heads*head_dim] = flat [q_dim]
-    for (int i = 0; i < q_dim; i++) {
-        float g = 1.0f / (1.0f + expf(-q_gate[i]));
-        attn_out[i] *= g;
+    if (q_gate) {
+        for (int i = 0; i < q_dim; i++) {
+            float g = 1.0f / (1.0f + expf(-q_gate[i]));
+            attn_out[i] *= g;
+        }
     }
 
     // ---- Output projection ----
@@ -3779,60 +4749,86 @@ static void moe_forward(
     uint16_t *norm_w = get_tensor_ptr(wf, name);
     cpu_rms_norm(hidden, norm_w, h_post, cfg.hidden_dim, cfg.rms_norm_eps);
 
-    // ---- Batch routing gate + shared expert gate/up + shared_expert_gate (4 matmuls, 1 commit) ----
+    // ---- Routing gate + (optionally) shared expert projections ----
     float *gate_scores = calloc(cfg.num_experts, sizeof(float));
-    float *shared_gate = calloc(cfg.shared_intermediate, sizeof(float));
-    float *shared_up = calloc(cfg.shared_intermediate, sizeof(float));
+    float *shared_gate = cfg.shared_intermediate > 0 ? calloc(cfg.shared_intermediate, sizeof(float)) : NULL;
+    float *shared_up   = cfg.shared_intermediate > 0 ? calloc(cfg.shared_intermediate, sizeof(float)) : NULL;
     float shared_gate_score = 0.0f;
 
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", layer_idx);
+    snprintf(name, sizeof(name), "model.layers.%d.%s.gate.weight", layer_idx, cfg.moe_prefix);
     uint32_t *gate_w = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.scales", layer_idx);
+    snprintf(name, sizeof(name), "model.layers.%d.%s.gate.scales", layer_idx, cfg.moe_prefix);
     uint16_t *gate_s = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", layer_idx);
+    snprintf(name, sizeof(name), "model.layers.%d.%s.gate.biases", layer_idx, cfg.moe_prefix);
     uint16_t *gate_b = get_tensor_ptr(wf, name);
 
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", layer_idx);
-    uint32_t *sgw = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", layer_idx);
-    uint16_t *sgs = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", layer_idx);
-    uint16_t *sgb = get_tensor_ptr(wf, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", layer_idx);
-    uint32_t *suw = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", layer_idx);
-    uint16_t *sus = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", layer_idx);
-    uint16_t *sub = get_tensor_ptr(wf, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", layer_idx);
-    uint32_t *seg_w = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", layer_idx);
-    uint16_t *seg_s = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", layer_idx);
-    uint16_t *seg_b = get_tensor_ptr(wf, name);
-
-    // All 4 matmuls share h_post as input -- batch into one command buffer
-    if (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
-        suw && sus && sub && seg_w && seg_s && seg_b) {
-        BatchMatvecSpec moe_specs[4] = {
-            { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)cfg.num_experts,        cfg.hidden_dim, cfg.group_size, 0 },
-            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
-            { suw,    sus,    sub,    shared_up,           (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
-            { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            cfg.hidden_dim, cfg.group_size, 3 },
-        };
-        fast_batch_matvec(h_post, cfg.hidden_dim, moe_specs, 4);
+    // Load routing bias if sigmoid routing (MiniMax)
+    float *routing_bias = NULL;
+    if (cfg.scoring_func == 1) {
+        snprintf(name, sizeof(name), "model.layers.%d.%s.e_score_correction_bias", layer_idx, cfg.moe_prefix);
+        routing_bias = get_tensor_ptr(wf, name);
     }
 
-    // Softmax routing scores
-    cpu_softmax(gate_scores, cfg.num_experts);
+    uint32_t *sgw = NULL, *suw = NULL, *seg_w_local = NULL;
+    uint16_t *sgs = NULL, *sus = NULL, *sgb = NULL, *sub = NULL, *seg_s_local = NULL, *seg_b_local = NULL;
 
-    // Top-K expert selection
+    if (cfg.shared_intermediate > 0) {
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", layer_idx);
+        sgw = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", layer_idx);
+        sgs = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", layer_idx);
+        sgb = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", layer_idx);
+        suw = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", layer_idx);
+        sus = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", layer_idx);
+        sub = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", layer_idx);
+        seg_w_local = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", layer_idx);
+        seg_s_local = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", layer_idx);
+        seg_b_local = get_tensor_ptr(wf, name);
+    }
+
+    // Batch matmuls: routing gate + (optionally) shared expert
+    if (gate_w && gate_s && gate_b) {
+        if (cfg.gate_bits != cfg.bits) {
+            // 8-bit routing gate: compute on CPU separately
+            cpu_dequant_matvec_nbits(gate_w, gate_s, gate_b, h_post, gate_scores,
+                                     cfg.num_experts, cfg.hidden_dim, cfg.gate_group_size, cfg.gate_bits);
+            if (cfg.shared_intermediate > 0 && sgw && sgs && sgb && suw && sus && sub && seg_w_local && seg_s_local && seg_b_local) {
+                BatchMatvecSpec moe_specs[3] = {
+                    { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                    { suw,    sus,    sub,    shared_up,           (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                    { seg_w_local,  seg_s_local,  seg_b_local,  &shared_gate_score,  1,                            cfg.hidden_dim, cfg.group_size, 3 },
+                };
+                fast_batch_matvec(h_post, cfg.hidden_dim, moe_specs, 3);
+            }
+        } else if (cfg.shared_intermediate > 0 && sgw && sgs && sgb && suw && sus && sub && seg_w_local && seg_s_local && seg_b_local) {
+            BatchMatvecSpec moe_specs[4] = {
+                { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)cfg.num_experts,        cfg.hidden_dim, cfg.group_size, 0 },
+                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                { suw,    sus,    sub,    shared_up,           (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                { seg_w_local,  seg_s_local,  seg_b_local,  &shared_gate_score,  1,                            cfg.hidden_dim, cfg.group_size, 3 },
+            };
+            fast_batch_matvec(h_post, cfg.hidden_dim, moe_specs, 4);
+        } else {
+            // No shared expert, same bits: just routing gate via GPU/fast
+            BatchMatvecSpec moe_specs[1] = {
+                { gate_w, gate_s, gate_b, gate_scores, (uint32_t)cfg.num_experts, cfg.hidden_dim, cfg.group_size, 0 },
+            };
+            fast_batch_matvec(h_post, cfg.hidden_dim, moe_specs, 1);
+        }
+    }
+
+    // Route experts (softmax for Qwen, sigmoid+bias for MiniMax)
     int expert_indices[64];
     float expert_weights[64];
-    cpu_topk(gate_scores, cfg.num_experts, K, expert_indices, expert_weights);
-    cpu_normalize_weights(expert_weights, K);
+    cpu_route_experts(gate_scores, cfg.num_experts, K,
+                      routing_bias, expert_indices, expert_weights);
 
     if (moe_dump) {
         fprintf(stderr, "[MOE-DUMP] routing: K=%d experts=[", K);
@@ -3913,55 +4909,59 @@ static void moe_forward(
         free(expert_out);
     }
 
-    // ---- Shared expert SwiGLU (gate_proj + up_proj already computed above) ----
-    float *shared_out = calloc(cfg.hidden_dim, sizeof(float));
-    float *shared_act = calloc(cfg.shared_intermediate, sizeof(float));
-    cpu_swiglu(shared_gate, shared_up, shared_act, cfg.shared_intermediate);
+    // ---- Shared expert SwiGLU + combine ----
+    float *shared_out = NULL;
+    float *shared_act = NULL;
 
-    if (moe_dump) {
-        fprintf(stderr, "[MOE-DUMP] layer=%d h_post_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                layer_idx, vec_rms(h_post, cfg.hidden_dim), h_post[0], h_post[1], h_post[2], h_post[3], h_post[4]);
-        fprintf(stderr, "[MOE-DUMP] gate_proj_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                vec_rms(shared_gate, cfg.shared_intermediate),
-                shared_gate[0], shared_gate[1], shared_gate[2], shared_gate[3], shared_gate[4]);
-        fprintf(stderr, "[MOE-DUMP] up_proj_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                vec_rms(shared_up, cfg.shared_intermediate),
-                shared_up[0], shared_up[1], shared_up[2], shared_up[3], shared_up[4]);
-        fprintf(stderr, "[MOE-DUMP] swiglu_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                vec_rms(shared_act, cfg.shared_intermediate),
-                shared_act[0], shared_act[1], shared_act[2], shared_act[3], shared_act[4]);
-    }
+    if (cfg.shared_intermediate > 0 && shared_gate && shared_up) {
+        shared_out = calloc(cfg.hidden_dim, sizeof(float));
+        shared_act = calloc(cfg.shared_intermediate, sizeof(float));
+        cpu_swiglu(shared_gate, shared_up, shared_act, cfg.shared_intermediate);
 
-    // shared_expert down_proj (separate dispatch — different input than h_post)
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", layer_idx);
-    uint32_t *sdw = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", layer_idx);
-    uint16_t *sds = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", layer_idx);
-    uint16_t *sdb = get_tensor_ptr(wf, name);
-    if (sdw && sds && sdb) {
-        fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out, cfg.hidden_dim,
-                            cfg.shared_intermediate, cfg.group_size);
-    }
+        if (moe_dump) {
+            fprintf(stderr, "[MOE-DUMP] layer=%d h_post_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                    layer_idx, vec_rms(h_post, cfg.hidden_dim), h_post[0], h_post[1], h_post[2], h_post[3], h_post[4]);
+            fprintf(stderr, "[MOE-DUMP] gate_proj_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                    vec_rms(shared_gate, cfg.shared_intermediate),
+                    shared_gate[0], shared_gate[1], shared_gate[2], shared_gate[3], shared_gate[4]);
+            fprintf(stderr, "[MOE-DUMP] up_proj_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                    vec_rms(shared_up, cfg.shared_intermediate),
+                    shared_up[0], shared_up[1], shared_up[2], shared_up[3], shared_up[4]);
+            fprintf(stderr, "[MOE-DUMP] swiglu_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                    vec_rms(shared_act, cfg.shared_intermediate),
+                    shared_act[0], shared_act[1], shared_act[2], shared_act[3], shared_act[4]);
+        }
 
-    // ---- Shared expert gate (sigmoid) -- already computed above ----
-    float shared_weight = cpu_sigmoid(shared_gate_score);
+        // shared_expert down_proj
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", layer_idx);
+        uint32_t *sdw = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", layer_idx);
+        uint16_t *sds = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", layer_idx);
+        uint16_t *sdb = get_tensor_ptr(wf, name);
+        if (sdw && sds && sdb) {
+            fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out, cfg.hidden_dim,
+                                cfg.shared_intermediate, cfg.group_size);
+        }
 
-    // Scale shared expert output
-    for (int i = 0; i < cfg.hidden_dim; i++) {
-        shared_out[i] *= shared_weight;
-    }
+        // Shared expert gate (sigmoid)
+        float shared_weight = cpu_sigmoid(shared_gate_score);
+        for (int i = 0; i < cfg.hidden_dim; i++) shared_out[i] *= shared_weight;
 
-    // ---- Combine: hidden = h_mid + moe_out + shared_out ----
-    for (int i = 0; i < cfg.hidden_dim; i++) {
-        hidden[i] = h_mid[i] + moe_out[i] + shared_out[i];
-    }
+        // Combine: hidden = h_mid + moe_out + shared_out
+        for (int i = 0; i < cfg.hidden_dim; i++)
+            hidden[i] = h_mid[i] + moe_out[i] + shared_out[i];
 
-    if (moe_debug) {
-        fprintf(stderr, "[MOE-DBG] layer=%d h_mid_rms=%.4f moe_rms=%.4f shared_rms=%.4f shared_gate=%.4f hidden_rms=%.4f\n",
-                layer_idx, vec_rms(h_mid, cfg.hidden_dim), vec_rms(moe_out, cfg.hidden_dim),
-                vec_rms(shared_out, cfg.hidden_dim), shared_weight,
-                vec_rms(hidden, cfg.hidden_dim));
+        if (moe_debug) {
+            fprintf(stderr, "[MOE-DBG] layer=%d h_mid_rms=%.4f moe_rms=%.4f shared_rms=%.4f shared_gate=%.4f hidden_rms=%.4f\n",
+                    layer_idx, vec_rms(h_mid, cfg.hidden_dim), vec_rms(moe_out, cfg.hidden_dim),
+                    vec_rms(shared_out, cfg.hidden_dim), shared_weight,
+                    vec_rms(hidden, cfg.hidden_dim));
+        }
+    } else {
+        // No shared expert (MiniMax): hidden = h_mid + moe_out
+        for (int i = 0; i < cfg.hidden_dim; i++)
+            hidden[i] = h_mid[i] + moe_out[i];
     }
 
     free(h_post);
@@ -4907,6 +5907,7 @@ typedef struct {
 
     // MoE routing + shared expert weights
     uint32_t *gate_w; uint16_t *gate_s, *gate_b;
+    float *routing_bias;                         // e_score_correction_bias (MiniMax, NULL for Qwen)
     uint32_t *sg_w;   uint16_t *sg_s, *sg_b;   // shared gate_proj
     uint32_t *su_w;   uint16_t *su_s, *su_b;   // shared up_proj
     uint32_t *sd_w;   uint16_t *sd_s, *sd_b;   // shared down_proj
@@ -5019,37 +6020,47 @@ static void build_layer_cache(WeightFile *wf) {
             lc->out_proj_b = get_tensor_ptr(wf, name);
         }
 
-        // MoE weights (same for all layers)
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", i);
+        // MoE routing gate (uses cfg.moe_prefix: "mlp" for Qwen, "block_sparse_moe" for MiniMax)
+        snprintf(name, sizeof(name), "model.layers.%d.%s.gate.weight", i, cfg.moe_prefix);
         lc->gate_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.scales", i);
+        snprintf(name, sizeof(name), "model.layers.%d.%s.gate.scales", i, cfg.moe_prefix);
         lc->gate_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", i);
+        snprintf(name, sizeof(name), "model.layers.%d.%s.gate.biases", i, cfg.moe_prefix);
         lc->gate_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
-        lc->sg_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", i);
-        lc->sg_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", i);
-        lc->sg_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", i);
-        lc->su_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", i);
-        lc->su_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", i);
-        lc->su_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
-        lc->sd_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", i);
-        lc->sd_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", i);
-        lc->sd_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", i);
-        lc->seg_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", i);
-        lc->seg_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", i);
-        lc->seg_b = get_tensor_ptr(wf, name);
+
+        // Routing bias (MiniMax e_score_correction_bias, NULL for Qwen)
+        if (cfg.scoring_func == 1) {
+            snprintf(name, sizeof(name), "model.layers.%d.%s.e_score_correction_bias", i, cfg.moe_prefix);
+            lc->routing_bias = get_tensor_ptr(wf, name);
+        }
+
+        // Shared expert weights (NULL when shared_intermediate == 0, e.g. MiniMax)
+        if (cfg.shared_intermediate > 0) {
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
+            lc->sg_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", i);
+            lc->sg_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", i);
+            lc->sg_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", i);
+            lc->su_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", i);
+            lc->su_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", i);
+            lc->su_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
+            lc->sd_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", i);
+            lc->sd_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", i);
+            lc->sd_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", i);
+            lc->seg_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", i);
+            lc->seg_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", i);
+            lc->seg_b = get_tensor_ptr(wf, name);
+        }
     }
 
     layer_cache_built = 1;
@@ -5111,19 +6122,22 @@ static void finalize_deferred_experts(void) {
             cpu_vec_madd(moe_out, expert_result, g_deferred.expert_weights[k], cfg.hidden_dim);
         }
 
-        // Read shared expert result
-        float shared_out[cfg.hidden_dim];
-        memcpy(shared_out, [g_metal->buf_shared_out contents], cfg.hidden_dim * sizeof(float));
+        if (cfg.shared_intermediate > 0) {
+            // Read shared expert result
+            float shared_out[cfg.hidden_dim];
+            memcpy(shared_out, [g_metal->buf_shared_out contents], cfg.hidden_dim * sizeof(float));
 
-        // Apply shared expert gate
-        float shared_weight = cpu_sigmoid(g_deferred.shared_gate_score);
-        for (int i = 0; i < cfg.hidden_dim; i++) {
-            shared_out[i] *= shared_weight;
-        }
+            // Apply shared expert gate
+            float shared_weight = cpu_sigmoid(g_deferred.shared_gate_score);
+            for (int i = 0; i < cfg.hidden_dim; i++) shared_out[i] *= shared_weight;
 
-        // Final combine: hidden = h_mid + moe_out + shared_out
-        for (int i = 0; i < cfg.hidden_dim; i++) {
-            g_deferred.hidden[i] = g_deferred.h_mid[i] + moe_out[i] + shared_out[i];
+            // Final combine: hidden = h_mid + moe_out + shared_out
+            for (int i = 0; i < cfg.hidden_dim; i++)
+                g_deferred.hidden[i] = g_deferred.h_mid[i] + moe_out[i] + shared_out[i];
+        } else {
+            // No shared expert: hidden = h_mid + moe_out
+            for (int i = 0; i < cfg.hidden_dim; i++)
+                g_deferred.hidden[i] = g_deferred.h_mid[i] + moe_out[i];
         }
     }
 
@@ -5229,15 +6243,17 @@ static void init_layer_scratch(void) {
     s_h_mid      = calloc(cfg.hidden_dim, sizeof(float));
     s_gate_scores = calloc(cfg.num_experts, sizeof(float));
     s_spec_gate_scores = calloc(cfg.num_experts, sizeof(float));
-    s_shared_gate = calloc(cfg.shared_intermediate, sizeof(float));
-    s_shared_up  = calloc(cfg.shared_intermediate, sizeof(float));
+    s_shared_gate = cfg.shared_intermediate > 0 ? calloc(cfg.shared_intermediate, sizeof(float)) : NULL;
+    s_shared_up   = cfg.shared_intermediate > 0 ? calloc(cfg.shared_intermediate, sizeof(float)) : NULL;
     s_moe_out    = calloc(cfg.hidden_dim, sizeof(float));
     s_shared_out = calloc(cfg.hidden_dim, sizeof(float));
-    s_q_proj_out = calloc(cfg.num_attn_heads * cfg.head_dim * 2, sizeof(float));
+    int q_proj_sz = cfg.has_attn_gate ? cfg.num_attn_heads * cfg.head_dim * 2
+                                      : cfg.num_attn_heads * cfg.head_dim;
+    s_q_proj_out = calloc(q_proj_sz, sizeof(float));
     s_k_proj_out = calloc(cfg.num_kv_heads * cfg.head_dim, sizeof(float));
     s_v_proj_out = calloc(cfg.num_kv_heads * cfg.head_dim, sizeof(float));
     s_q          = calloc(cfg.num_attn_heads * cfg.head_dim, sizeof(float));
-    s_q_gate     = calloc(cfg.num_attn_heads * cfg.head_dim, sizeof(float));
+    s_q_gate     = cfg.has_attn_gate ? calloc(cfg.num_attn_heads * cfg.head_dim, sizeof(float)) : NULL;
     s_attn_out   = calloc(cfg.num_attn_heads * cfg.head_dim, sizeof(float));
     s_qkv_proj_out = calloc(cfg.linear_conv_dim, sizeof(float));
     s_z_proj_out   = calloc(cfg.linear_total_value, sizeof(float));
@@ -5248,6 +6264,27 @@ static void init_layer_scratch(void) {
     s_gated_out  = calloc(cfg.linear_total_value, sizeof(float));
 }
 
+// Pre-computed projection results for batched prefill (NULL = compute projections normally)
+typedef struct {
+    float *proj[4];  // Full attn: [0]=Q, [1]=K, [2]=V; Linear: [0]=QKV, [1]=Z, [2]=beta, [3]=alpha
+    int dims[4];     // Output dimension for each projection
+    int count;       // Number of projections (3 for full, 4 for linear)
+} PrecomputedProj;
+
+static void fused_layer_forward_ex(
+    WeightFile *wf,
+    int layer_idx,
+    float *hidden,
+    KVCache *kv,
+    LinearAttnState *la_state,
+    int pos,
+    const void *mmap_base,
+    int K,
+    int packed_fd,
+    PrecomputedProj *precomp  // NULL = compute projections, non-NULL = skip CMD1
+);
+
+// Original interface (all existing call sites use this)
 void fused_layer_forward(
     WeightFile *wf,
     int layer_idx,
@@ -5259,6 +6296,41 @@ void fused_layer_forward(
     int K,                   // number of active experts
     int packed_fd            // fd for packed expert file
 ) {
+    fused_layer_forward_ex(wf, layer_idx, hidden, kv, la_state, pos, mmap_base, K, packed_fd, NULL);
+}
+
+static void fused_layer_forward_ex(
+    WeightFile *wf,
+    int layer_idx,
+    float *hidden,
+    KVCache *kv,
+    LinearAttnState *la_state,
+    int pos,
+    const void *mmap_base,
+    int K,
+    int packed_fd,
+    PrecomputedProj *precomp
+) {
+    // Per-layer quant: temporarily switch to the per-layer expert format
+    int saved_use_2bit = g_use_2bit;
+    int saved_use_q3_experts = g_use_q3_experts;
+    int saved_use_q3_outlier = g_use_q3_outlier;
+    ExpertLayout saved_active_q3_layout = g_active_q3_layout;
+    int saved_active_q3_layout_valid = g_active_q3_layout_valid;
+    if (saved_use_2bit) g_use_2bit = g_layer_is_2bit[layer_idx];
+    if (saved_use_q3_experts) {
+        g_use_q3_outlier = g_layer_is_q3_outlier[layer_idx];
+        g_use_q3_experts = g_layer_is_q3_hybrid[layer_idx] || g_layer_is_q3_outlier[layer_idx];
+        if ((g_use_q3_experts || g_use_q3_outlier) &&
+            g_q3_layout_manifest_loaded &&
+            g_q3_layer_layout_valid[layer_idx]) {
+            g_active_q3_layout = g_q3_layer_layouts[layer_idx];
+            g_active_q3_layout_valid = 1;
+        } else {
+            g_active_q3_layout_valid = 0;
+        }
+    }
+
     double t_layer_start = 0, t0 = 0, t1 = 0;
     if (g_timing_enabled) { t_layer_start = now_ms(); }
     int pred_started = 0;  // set to 1 if we started prediction preads during CMD1_wait
@@ -5279,7 +6351,8 @@ void fused_layer_forward(
     float *qkv_out = NULL, *z_out = NULL, *beta_out = NULL, *alpha_out = NULL;
 
     if (is_full) {
-        int q_proj_dim = cfg.num_attn_heads * cfg.head_dim * 2;
+        int q_dim_full = cfg.num_attn_heads * cfg.head_dim;
+        int q_proj_dim = cfg.has_attn_gate ? q_dim_full * 2 : q_dim_full;
         int kv_dim = cfg.num_kv_heads * cfg.head_dim;
 
         q_proj_out = s_q_proj_out;
@@ -5319,11 +6392,54 @@ void fused_layer_forward(
     int gpu_linear_attn = 0;  // set to 1 if GPU handles entire linear attention pipeline
     int cmd1_cmd2_merged = 0; // set to 1 if CMD2 work is merged into CMD1 (linear attn optimization)
 
-    // Pre-compute linear_layer_idx for GPU linear attention encoding in CMD1
+    // Pre-compute linear_layer_idx (needed in Phase 2 for delta-net)
     int linear_layer_idx = -1;
     if (!is_full) {
         linear_layer_idx = cfg.linear_index[layer_idx];
     }
+
+    // Variables declared here to allow goto to skip over CMD1
+    dispatch_group_t spec_group = NULL;
+    int spec_preload_count = 0;
+    int spec_routing_enabled = 0;  // DISABLED: cache pollution + overhead makes it slower
+
+    // ---- PRECOMPUTED PROJECTION SKIP ----
+    // If precomp is set, projections were already computed by batched GEMM.
+    // Copy results into scratch buffers, handle deferred completion, skip CMD1.
+    if (precomp) {
+        // Complete deferred experts from previous layer
+        if (g_timing_enabled) { t0 = now_ms(); }
+        wait_deferred_experts_gpu();
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_wait += t1 - t0; }
+        if (g_timing_enabled) { t0 = now_ms(); }
+        finalize_deferred_experts();
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
+
+        // Residual = hidden before attention
+        cpu_vec_copy(residual, hidden, HIDDEN_DIM);
+
+        // Compute input norm and upload to buf_input (needed by CMD2 fused path)
+        cpu_rms_norm(hidden, lc->input_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+        if (g_metal && g_metal->buf_input) {
+            memcpy([g_metal->buf_input contents], normed, HIDDEN_DIM * sizeof(float));
+        }
+
+        // Copy pre-computed projections into scratch buffers
+        if (is_full) {
+            memcpy(q_proj_out, precomp->proj[0], precomp->dims[0] * sizeof(float));
+            memcpy(k_out,      precomp->proj[1], precomp->dims[1] * sizeof(float));
+            memcpy(v_out,      precomp->proj[2], precomp->dims[2] * sizeof(float));
+        } else {
+            memcpy(qkv_out,    precomp->proj[0], precomp->dims[0] * sizeof(float));
+            memcpy(z_out,      precomp->proj[1], precomp->dims[1] * sizeof(float));
+            memcpy(beta_out,   precomp->proj[2], precomp->dims[2] * sizeof(float));
+            memcpy(alpha_out,  precomp->proj[3], precomp->dims[3] * sizeof(float));
+        }
+
+        // Skip CMD1 entirely — jump to PHASE 2 (attention compute)
+        goto phase2_attention;
+    }
+
     // Can we run the full linear attention pipeline on GPU in CMD1?
     int can_gpu_linear = (gpu_linear_attn_enabled &&
                           !is_full && g_metal && g_metal->delta_net_step &&
@@ -5758,10 +6874,6 @@ void fused_layer_forward(
     // After CPU attention, we wait for the group to finish. When the real routing
     // happens later, predicted experts are already in the LRU cache as hits.
 
-    dispatch_group_t spec_group = NULL;
-    int spec_preload_count = 0;
-    int spec_routing_enabled = 0;  // DISABLED: cache pollution + overhead makes it slower
-
     if (g_timing_enabled) { t0 = now_ms(); }
     s_spec_count = 0;
 
@@ -5773,11 +6885,11 @@ void fused_layer_forward(
         cpu_dequant_matvec(lc->gate_w, lc->gate_s, lc->gate_b,
                            normed, spec_scores,
                            cfg.num_experts, cfg.hidden_dim, cfg.group_size);
-        cpu_softmax(spec_scores, cfg.num_experts);
 
         int spec_K = (K > MAX_K) ? MAX_K : K;
         float spec_weights[MAX_K];
-        cpu_topk(spec_scores, cfg.num_experts, spec_K, s_spec_indices, spec_weights);
+        cpu_route_experts(spec_scores, cfg.num_experts, spec_K,
+                          lc->routing_bias, s_spec_indices, spec_weights);
         s_spec_count = spec_K;
 
         g_spec_route_attempts += spec_K;
@@ -5841,6 +6953,7 @@ void fused_layer_forward(
     // =====================================================================
     // PHASE 2: CPU attention compute
     // =====================================================================
+phase2_attention:
 
     if (g_timing_enabled) { t0 = now_ms(); }
 
@@ -5873,38 +6986,60 @@ void fused_layer_forward(
 
     if (is_full) {
         // ---- Full attention CPU compute ----
-        int q_proj_dim = cfg.num_attn_heads * cfg.head_dim * 2;
         int q_dim = cfg.num_attn_heads * cfg.head_dim;
         int kv_dim = cfg.num_kv_heads * cfg.head_dim;
-        (void)q_proj_dim;
 
         float *q = s_q;
-        float *q_gate = s_q_gate;
-        for (int h = 0; h < cfg.num_attn_heads; h++) {
-            float *src = q_proj_out + h * (2 * cfg.head_dim);
-            memcpy(q + h * cfg.head_dim, src, cfg.head_dim * sizeof(float));
-            memcpy(q_gate + h * cfg.head_dim, src + cfg.head_dim, cfg.head_dim * sizeof(float));
+        float *q_gate = s_q_gate;  // NULL for MiniMax (no gate)
+
+        // Split q_proj_out into queries and gate (Qwen) or just copy (MiniMax)
+        if (cfg.has_attn_gate) {
+            for (int h = 0; h < cfg.num_attn_heads; h++) {
+                float *src = q_proj_out + h * (2 * cfg.head_dim);
+                memcpy(q + h * cfg.head_dim, src, cfg.head_dim * sizeof(float));
+                memcpy(q_gate + h * cfg.head_dim, src + cfg.head_dim, cfg.head_dim * sizeof(float));
+            }
+        } else {
+            memcpy(q, q_proj_out, q_dim * sizeof(float));
         }
 
         // Q/K RMSNorm
         uint16_t *qnorm_w = lc->q_norm_w;
         uint16_t *knorm_w = lc->k_norm_w;
         if (qnorm_w) {
-            for (int h = 0; h < cfg.num_attn_heads; h++) {
-                float *qh = q + h * cfg.head_dim;
+            if (cfg.qk_norm_per_layer) {
+                // MiniMax: RMSNorm over entire flat q vector [num_heads * head_dim]
                 float sum_sq = 0.0f;
-                for (int i = 0; i < cfg.head_dim; i++) sum_sq += qh[i] * qh[i];
-                float inv_rms = 1.0f / sqrtf(sum_sq / cfg.head_dim + cfg.rms_norm_eps);
-                for (int i = 0; i < cfg.head_dim; i++) qh[i] = qh[i] * inv_rms * bf16_to_f32(qnorm_w[i]);
+                for (int i = 0; i < q_dim; i++) sum_sq += q[i] * q[i];
+                float inv_rms = 1.0f / sqrtf(sum_sq / q_dim + cfg.rms_norm_eps);
+                for (int i = 0; i < q_dim; i++) q[i] = q[i] * inv_rms * bf16_to_f32(qnorm_w[i]);
+            } else {
+                // Qwen: RMSNorm per head, weight is [head_dim] shared across heads
+                for (int h = 0; h < cfg.num_attn_heads; h++) {
+                    float *qh = q + h * cfg.head_dim;
+                    float sum_sq = 0.0f;
+                    for (int i = 0; i < cfg.head_dim; i++) sum_sq += qh[i] * qh[i];
+                    float inv_rms = 1.0f / sqrtf(sum_sq / cfg.head_dim + cfg.rms_norm_eps);
+                    for (int i = 0; i < cfg.head_dim; i++) qh[i] = qh[i] * inv_rms * bf16_to_f32(qnorm_w[i]);
+                }
             }
         }
         if (knorm_w) {
-            for (int h = 0; h < cfg.num_kv_heads; h++) {
-                float *kh = k_out + h * cfg.head_dim;
+            if (cfg.qk_norm_per_layer) {
+                // MiniMax: RMSNorm over entire flat k vector [num_kv_heads * head_dim]
                 float sum_sq = 0.0f;
-                for (int i = 0; i < cfg.head_dim; i++) sum_sq += kh[i] * kh[i];
-                float inv_rms = 1.0f / sqrtf(sum_sq / cfg.head_dim + cfg.rms_norm_eps);
-                for (int i = 0; i < cfg.head_dim; i++) kh[i] = kh[i] * inv_rms * bf16_to_f32(knorm_w[i]);
+                for (int i = 0; i < kv_dim; i++) sum_sq += k_out[i] * k_out[i];
+                float inv_rms = 1.0f / sqrtf(sum_sq / kv_dim + cfg.rms_norm_eps);
+                for (int i = 0; i < kv_dim; i++) k_out[i] = k_out[i] * inv_rms * bf16_to_f32(knorm_w[i]);
+            } else {
+                // Qwen: RMSNorm per head
+                for (int h = 0; h < cfg.num_kv_heads; h++) {
+                    float *kh = k_out + h * cfg.head_dim;
+                    float sum_sq = 0.0f;
+                    for (int i = 0; i < cfg.head_dim; i++) sum_sq += kh[i] * kh[i];
+                    float inv_rms = 1.0f / sqrtf(sum_sq / cfg.head_dim + cfg.rms_norm_eps);
+                    for (int i = 0; i < cfg.head_dim; i++) kh[i] = kh[i] * inv_rms * bf16_to_f32(knorm_w[i]);
+                }
             }
         }
 
@@ -5983,7 +7118,10 @@ void fused_layer_forward(
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
             memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
-            memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
+            if (q_gate)
+                memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
+            else
+                memset([g_metal->buf_attn_gate contents], 0, q_dim * sizeof(float)); // no gate = no-op sigmoid(0)=0.5 — but GPU sigmoid_gate kernel will be skipped
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
             // CPU fallback (also used when H2O is active, for score tracking)
@@ -6018,9 +7156,12 @@ void fused_layer_forward(
                 }
                 free(scores);
             }
-            for (int i = 0; i < q_dim; i++) {
-                float g = 1.0f / (1.0f + expf(-q_gate[i]));
-                attn_out[i] *= g;
+            // Apply sigmoid gate (Qwen only)
+            if (q_gate) {
+                for (int i = 0; i < q_dim; i++) {
+                    float g = 1.0f / (1.0f + expf(-q_gate[i]));
+                    attn_out[i] *= g;
+                }
             }
         }
 
@@ -6235,11 +7376,14 @@ void fused_layer_forward(
 
     // Zero-init for non-merged path (CMD2 will populate these)
     memset(gate_scores, 0, cfg.num_experts * sizeof(float));
-    memset(shared_gate, 0, cfg.shared_intermediate * sizeof(float));
-    memset(shared_up, 0, cfg.shared_intermediate * sizeof(float));
+    if (cfg.shared_intermediate > 0) {
+        memset(shared_gate, 0, cfg.shared_intermediate * sizeof(float));
+        memset(shared_up, 0, cfg.shared_intermediate * sizeof(float));
+    }
 
-    int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
-                            suw && sus && sub && seg_w && seg_s && seg_b);
+    int have_moe_weights = (gate_w && gate_s && gate_b);
+    int have_shared_weights = (cfg.shared_intermediate > 0 && sgw && sgs && sgb &&
+                               suw && sus && sub && seg_w && seg_s && seg_b);
 
     // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
@@ -6430,8 +7574,8 @@ void fused_layer_forward(
                     [enc endEncoding];
                 }
             }
-            // Enc A4: sigmoid_gate (same for all paths)
-            {
+            // Enc A4: sigmoid_gate (Qwen only — skip for MiniMax)
+            if (cfg.has_attn_gate) {
                 uint32_t qdim = cfg.num_attn_heads * cfg.head_dim;
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->sigmoid_gate_pipe];
@@ -6528,25 +7672,46 @@ void fused_layer_forward(
             [enc endEncoding];
         }
 
-        // ---- Enc 5-8: routing + shared expert projections (read buf_input) ----
-        BatchMatvecSpec moe_specs[4] = {
-            { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)cfg.num_experts,        cfg.hidden_dim, cfg.group_size, 0 },
-            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
-            { suw,    sus,    sub,    shared_up,           (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
-            { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            cfg.hidden_dim, cfg.group_size, 3 },
-        };
+        // ---- Enc 5+: routing gate + (optionally) shared expert projections ----
+        // If routing gate uses different quantization (e.g. 8-bit for MiniMax),
+        // skip it from GPU batch and compute on CPU after readback.
+        int gate_on_cpu = (cfg.gate_bits != cfg.bits);
+        int num_moe_specs;
+        BatchMatvecSpec moe_specs[4];
+        if (gate_on_cpu) {
+            // GPU: only shared expert specs (if any), skip gate
+            if (have_shared_weights) {
+                moe_specs[0] = (BatchMatvecSpec){ sgw,    sgs,    sgb,    shared_gate,         (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 };
+                moe_specs[1] = (BatchMatvecSpec){ suw,    sus,    sub,    shared_up,           (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 };
+                moe_specs[2] = (BatchMatvecSpec){ seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            cfg.hidden_dim, cfg.group_size, 3 };
+                num_moe_specs = 3;
+            } else {
+                num_moe_specs = 0;  // Nothing to batch on GPU
+            }
+        } else if (have_shared_weights) {
+            moe_specs[0] = (BatchMatvecSpec){ gate_w, gate_s, gate_b, gate_scores,        (uint32_t)cfg.num_experts,        cfg.hidden_dim, cfg.group_size, 0 };
+            moe_specs[1] = (BatchMatvecSpec){ sgw,    sgs,    sgb,    shared_gate,         (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 };
+            moe_specs[2] = (BatchMatvecSpec){ suw,    sus,    sub,    shared_up,           (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 };
+            moe_specs[3] = (BatchMatvecSpec){ seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            cfg.hidden_dim, cfg.group_size, 3 };
+            num_moe_specs = 4;
+        } else {
+            moe_specs[0] = (BatchMatvecSpec){ gate_w, gate_s, gate_b, gate_scores, (uint32_t)cfg.num_experts, cfg.hidden_dim, cfg.group_size, 0 };
+            num_moe_specs = 1;
+        }
         // buf_input already contains h_post from Enc 4 output -- no memcpy needed
-        gpu_encode_batch_matvec(g_metal, cmd_fused, moe_specs, 4);
+        if (num_moe_specs > 0)
+            gpu_encode_batch_matvec(g_metal, cmd_fused, moe_specs, num_moe_specs);
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
 
-        // ---- Single commit+wait for all 8 encoders ----
+        // ---- Single commit+wait ----
         if (g_timing_enabled) { t0 = now_ms(); }
         [cmd_fused commit];
         [cmd_fused waitUntilCompleted];
 
         // Read back results
-        gpu_flush_batch_results(g_metal, moe_specs, 4);
+        if (num_moe_specs > 0)
+            gpu_flush_batch_results(g_metal, moe_specs, num_moe_specs);
         // Read h_mid from GPU buffer (needed for final combine)
         memcpy(h_mid, [g_metal->buf_h_mid contents], cfg.hidden_dim * sizeof(float));
         // Read h_post from buf_input (needed for expert input)
@@ -6554,6 +7719,13 @@ void fused_layer_forward(
         // Update hidden state to h_mid (= residual + o_proj)
         memcpy(hidden, h_mid, cfg.hidden_dim * sizeof(float));
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_wait += t1 - t0; }
+
+        // CPU routing gate for non-standard quantization (e.g. 8-bit MiniMax gate)
+        if (gate_on_cpu && gate_w && gate_s && gate_b) {
+            cpu_dequant_matvec_nbits((const uint32_t *)gate_w, (const uint16_t *)gate_s, (const uint16_t *)gate_b,
+                                     h_post, gate_scores,
+                                     cfg.num_experts, cfg.hidden_dim, cfg.gate_group_size, cfg.gate_bits);
+        }
 
     } else {
         // ---- Non-fused fallback path ----
@@ -6576,27 +7748,46 @@ void fused_layer_forward(
         // Post-attention norm
         cpu_rms_norm(hidden, lc->post_attn_norm_w, h_post, cfg.hidden_dim, cfg.rms_norm_eps);
 
-        // Routing + shared expert batch
+        // Routing + (optionally) shared expert batch
         if (have_moe_weights) {
-            BatchMatvecSpec moe_specs[4] = {
-                { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)cfg.num_experts,        cfg.hidden_dim, cfg.group_size, 0 },
-                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
-                { suw,    sus,    sub,    shared_up,           (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
-                { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            cfg.hidden_dim, cfg.group_size, 3 },
-            };
-            fast_batch_matvec(h_post, cfg.hidden_dim, moe_specs, 4);
+            // If routing gate uses different quantization (e.g. 8-bit), compute it separately on CPU
+            if (cfg.gate_bits != cfg.bits) {
+                cpu_dequant_matvec_nbits(gate_w, gate_s, gate_b, h_post, gate_scores,
+                                         cfg.num_experts, cfg.hidden_dim, cfg.gate_group_size, cfg.gate_bits);
+                // Batch only shared expert specs (if any)
+                if (have_shared_weights) {
+                    BatchMatvecSpec moe_specs[3] = {
+                        { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                        { suw,    sus,    sub,    shared_up,           (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                        { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            cfg.hidden_dim, cfg.group_size, 3 },
+                    };
+                    fast_batch_matvec(h_post, cfg.hidden_dim, moe_specs, 3);
+                }
+            } else if (have_shared_weights) {
+                BatchMatvecSpec moe_specs[4] = {
+                    { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)cfg.num_experts,        cfg.hidden_dim, cfg.group_size, 0 },
+                    { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                    { suw,    sus,    sub,    shared_up,           (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                    { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            cfg.hidden_dim, cfg.group_size, 3 },
+                };
+                fast_batch_matvec(h_post, cfg.hidden_dim, moe_specs, 4);
+            } else {
+                BatchMatvecSpec moe_specs[1] = {
+                    { gate_w, gate_s, gate_b, gate_scores, (uint32_t)cfg.num_experts, cfg.hidden_dim, cfg.group_size, 0 },
+                };
+                fast_batch_matvec(h_post, cfg.hidden_dim, moe_specs, 1);
+            }
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
     }
 
 cmd2_done:
-    // ---- Softmax + top-K (CPU) ----
+    // ---- Route experts (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
-    cpu_softmax(gate_scores, cfg.num_experts);
     int expert_indices[64];
     float expert_weights[64];
-    cpu_topk(gate_scores, cfg.num_experts, K, expert_indices, expert_weights);
-    cpu_normalize_weights(expert_weights, K);
+    cpu_route_experts(gate_scores, cfg.num_experts, K,
+                      lc->routing_bias, expert_indices, expert_weights);
     if (g_freq_tracking) {
         for (int k = 0; k < K; k++) {
             FREQ(layer_idx, expert_indices[k])++;
@@ -7061,6 +8252,11 @@ cmd2_done:
         // Return immediately — GPU experts are running async.
         // The next call to fused_layer_forward() or complete_deferred_experts()
         // will wait for the GPU and apply the final combine.
+        g_use_2bit = saved_use_2bit;
+        g_use_q3_outlier = saved_use_q3_outlier;
+        g_use_q3_experts = saved_use_q3_experts;
+        g_active_q3_layout = saved_active_q3_layout;
+        g_active_q3_layout_valid = saved_active_q3_layout_valid;
         return;
 
     } else if (packed_fd >= 0) {
@@ -7153,6 +8349,13 @@ cmd2_done:
 
     // h_post, h_mid, gate_scores, moe_out, shared_out, shared_gate, shared_up
     // are all static scratch buffers — no free needed.
+
+    // Restore global expert quant flag(s)
+    g_use_2bit = saved_use_2bit;
+    g_use_q3_outlier = saved_use_q3_outlier;
+    g_use_q3_experts = saved_use_q3_experts;
+    g_active_q3_layout = saved_active_q3_layout;
+    g_active_q3_layout_valid = saved_active_q3_layout_valid;
 }
 
 // ============================================================================
@@ -8256,6 +9459,14 @@ static void print_usage(const char *prog) {
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
+    printf("  --ppl PATH           Measure perplexity on ground truth token file\n");
+    printf("  --stream             Clean streaming output (no progress, no stats)\n");
+    printf("  --pfb N              Enable batched prefill\n");
+    printf("  --prefill-skip-experts  Skip routed experts for intermediate prefill tokens (shared expert only)\n");
+    printf("  --no-batched-linear  Disable batched linear-attention prefill kernels (uses routed MoE tail + batched full-attn)\n");
+    printf("  --gguf-embedding P   Use extracted GGUF Q8_0 embedding blob\n");
+    printf("  --nax                Enable NAX tensor matmul for LM head (Metal 4+, SLOWER for M=1 decode)\n");
+    printf("  --no-nax             Disable NAX (default)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --fp8                Use FP8 E4M3 KV cache (4x memory reduction)\n");
     printf("  --fused-attn         Enable fused online softmax attention (experimental)\n");
@@ -8270,6 +9481,9 @@ static void print_usage(const char *prog) {
     printf("  --help               This message\n");
 }
 
+// Batched prefill implementation (separate file for maintainability)
+#include "batched_prefill.h"
+
 #ifndef INFER_LIB_MODE
 int main(int argc, char **argv) {
     @autoreleasepool {
@@ -8279,8 +9493,10 @@ int main(int argc, char **argv) {
         const char *vocab_path = NULL;
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
+        const char *ppl_tokens_path = NULL;
         int max_tokens = 20;
         int K = 8;
+        int K_explicit = 0;  // set to 1 if --k was passed
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
@@ -8319,6 +9535,15 @@ int main(int argc, char **argv) {
             {"sliding-window", required_argument, 0, 1009},
             {"h2o",            required_argument, 0, 1010},
             {"h2o-sinks",      required_argument, 0, 1011},
+            {"ppl",           required_argument, 0, 905},
+            {"stream",        no_argument,       0, 'O'},
+            {"nax",           no_argument,       0, 'X'},
+            {"no-nax",        no_argument,       0, 'x'},
+            {"pfb",           required_argument, 0, 900},
+            {"prefill-skip-experts", no_argument, 0, 901},
+            {"prefill-k",     required_argument, 0, 903},
+            {"prefill-experts-full-only", no_argument, 0, 904},
+            {"no-batched-linear", no_argument, 0, 902},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -8333,7 +9558,7 @@ int main(int argc, char **argv) {
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
-                case 'k': K = atoi(optarg); break;
+                case 'k': K = atoi(optarg); K_explicit = 1; break;
                 case 'C': cache_entries = atoi(optarg); break;
                 case 'M': malloc_cache_entries = atoi(optarg); break;
                 case 'L': gpu_linear_attn_enabled = 0; break;
@@ -8365,6 +9590,18 @@ int main(int argc, char **argv) {
                 case 1009: g_sliding_window = atoi(optarg); break;
                 case 1010: g_h2o_budget = atoi(optarg); break;
                 case 1011: g_h2o_num_sinks = atoi(optarg); break;
+                case 905: ppl_tokens_path = optarg; break;
+                case 'O': g_stream_mode = 1; break;
+                case 'X': g_nax_disabled = 0; break;  // --nax: enable
+                case 'x': g_nax_disabled = 1; break;  // --no-nax: disable
+                case 900: g_prefill_batch = atoi(optarg);
+                    if (g_prefill_batch < 1) g_prefill_batch = 1;
+                    if (g_prefill_batch > MAX_PFB) g_prefill_batch = MAX_PFB;
+                    break;
+                case 901: g_prefill_skip_experts = 1; break;
+                case 903: g_prefill_k = atoi(optarg); break;
+                case 904: g_prefill_experts_full_only = 1; break;
+                case 902: g_disable_batched_linear = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -8436,6 +9673,22 @@ int main(int argc, char **argv) {
                 }
             }
             vocab_path = default_vocab;
+        }
+
+        // Update K from config (unless explicitly overridden via --k)
+        // The 397B model uses K=4 (actual active) despite num_experts_per_tok=10 in config
+        // Other models (35B) use K=8. Auto-set K from config, capped to MAX_K.
+        {
+            int config_k = cfg.num_experts_per_tok;
+            if (config_k > MAX_K) config_k = MAX_K;
+            // Only override if user didn't explicitly set K via --k
+            // (we detect this by checking if K is still the default 4)
+            if (!K_explicit) {
+                K = config_k;
+                fprintf(stderr, "[config] K auto-set to %d from config (use --k N to override)\n", K);
+            } else {
+                fprintf(stderr, "[config] K override: %d (model default: %d)\n", K, cfg.num_experts_per_tok);
+            }
         }
 
         // ---- Initialize Metal ----
@@ -8585,16 +9838,74 @@ int main(int argc, char **argv) {
         void **layer_mmaps = calloc(cfg.num_layers, sizeof(void *));
         size_t *layer_mmap_sizes = calloc(cfg.num_layers, sizeof(size_t));
         int expert_layers_available = 0;
+        int q3_layout_loaded = 0;
 
         // Reset the global seen-expert bitset
         memset(g_expert_seen, 0, cfg.num_layers * ((cfg.num_experts + 7) / 8));
 
+        int layers_2bit = 0, layers_q3 = 0, layers_q3_outlier = 0, layers_4bit = 0;
+        memset(g_layer_is_2bit, 0, sizeof(g_layer_is_2bit));
+        memset(g_layer_is_q3_hybrid, 0, sizeof(g_layer_is_q3_hybrid));
+        memset(g_layer_is_q3_outlier, 0, sizeof(g_layer_is_q3_outlier));
+        if (g_use_q3_experts) {
+            q3_layout_loaded = load_q3_layout_manifest(model_path);
+        }
+
         for (int i = 0; i < cfg.num_layers; i++) {
             char path[1024];
-            snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
-                     g_use_tiered ? "packed_experts_tiered" :
-                     g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
-            layer_fds[i] = open(path, O_RDONLY);
+            layer_fds[i] = -1;
+
+            if (g_use_tiered) {
+                snprintf(path, sizeof(path), "%s/packed_experts_tiered/layer_%02d.bin", model_path, i);
+                layer_fds[i] = open(path, O_RDONLY);
+            } else if (g_use_q3_experts) {
+                snprintf(path, sizeof(path), "%s/packed_experts_Q3/layer_%02d.bin", model_path, i);
+                layer_fds[i] = open(path, O_RDONLY);
+                if (layer_fds[i] >= 0) {
+                    if (q3_layout_loaded && g_q3_layer_layout_valid[i]) {
+                        if (expert_layout_is_q3_outlier(&g_q3_layer_layouts[i])) {
+                            g_layer_is_q3_outlier[i] = 1;
+                            layers_q3_outlier++;
+                        } else {
+                            g_layer_is_q3_hybrid[i] = 1;
+                            layers_q3++;
+                        }
+                    } else if (i == Q3_OUTLIER_LAYER) {
+                        g_layer_is_q3_outlier[i] = 1;
+                        layers_q3_outlier++;
+                    } else {
+                        g_layer_is_q3_hybrid[i] = 1;
+                        layers_q3++;
+                    }
+                } else {
+                    snprintf(path, sizeof(path), "%s/packed_experts/layer_%02d.bin", model_path, i);
+                    layer_fds[i] = open(path, O_RDONLY);
+                    if (layer_fds[i] >= 0) {
+                        g_layer_is_q3_hybrid[i] = 0;
+                        layers_4bit++;
+                    }
+                }
+            } else if (g_use_2bit) {
+                // Try 2-bit first
+                snprintf(path, sizeof(path), "%s/packed_experts_2bit/layer_%02d.bin", model_path, i);
+                layer_fds[i] = open(path, O_RDONLY);
+                if (layer_fds[i] >= 0) {
+                    g_layer_is_2bit[i] = 1;
+                    layers_2bit++;
+                } else {
+                    // Fall back to 4-bit for this layer
+                    snprintf(path, sizeof(path), "%s/packed_experts/layer_%02d.bin", model_path, i);
+                    layer_fds[i] = open(path, O_RDONLY);
+                    if (layer_fds[i] >= 0) {
+                        g_layer_is_2bit[i] = 0;
+                        layers_4bit++;
+                    }
+                }
+            } else {
+                snprintf(path, sizeof(path), "%s/packed_experts/layer_%02d.bin", model_path, i);
+                layer_fds[i] = open(path, O_RDONLY);
+            }
+
             layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
             layer_mmaps[i] = MAP_FAILED;
             layer_mmap_sizes[i] = 0;
@@ -8748,15 +10059,34 @@ int main(int argc, char **argv) {
         }
 
         // ---- Batch prefill loop ----
-        // Process all prompt tokens through the model. For intermediate tokens
-        // (not the last), we use discard_deferred_experts() which waits for the GPU
-        // but skips the CPU readback/combine of the last layer's expert outputs.
-        // This is safe because the hidden state from intermediate prefill tokens
-        // is immediately overwritten by the next token's embedding — the recurrent
-        // state (KV cache, delta-net state) is already updated inside fused_layer_forward.
-        if (pt->count > 1) {
+        double prefill_only_ms = 0;  // prefill time excluding last token + LM head
+        int prefill_token_count = pt->count > 1 ? pt->count - 1 : 0;
+        int prefill_was_batched = 0;
+        double t_prefill_start = now_ms();
+
+        if (pt->count > 1 && g_prefill_batch > 1 &&
+            (effective_prefill_skip_experts() || g_prefill_experts_full_only)) {
+            // Batched prefill (see batched_prefill.h)
+            // Linear layers: always K=0 (batched, shared expert only)
+            // Full attention layers: batched projections + attention, then:
+            //   - if experts_full_only: per-token expert I/O at full-attn layers
+            //   - if skip_experts: shared expert only (fastest)
+            int num_prefill = pt->count - 1;
+            pos += batched_prefill_k0(wf, hidden, embed_batch, num_prefill, pos,
+                                       kv_caches, layer_states, layer_mmaps, layer_fds, K);
+            prefill_only_ms = now_ms() - t_prefill_start;
+            prefill_was_batched = 1;
+
+        } else if (pt->count > 1) {
+            // ================================================================
+            // ORIGINAL PREFILL: one token at a time through all layers
+            // ================================================================
             double t_prefill_batch = now_ms();
             double first_tok_ms = 0;
+            int per_tok_K = (g_prefill_k >= 0) ? g_prefill_k :
+                            (effective_prefill_skip_experts() ? 0 : K);
+            printf("[prefill] starting %d tokens | per-token K=%d skip_experts=%d experts_full_only=%d\n",
+                   pt->count - 1, per_tok_K, effective_prefill_skip_experts(), g_prefill_experts_full_only);
 
             for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) { @autoreleasepool {
                 double t_tok = now_ms();
@@ -8766,19 +10096,22 @@ int main(int argc, char **argv) {
                 memcpy(hidden, embed_batch + (size_t)token_idx * cfg.hidden_dim,
                        cfg.hidden_dim * sizeof(float));
 
-                // Run through all 60 transformer layers
+                int prefill_K = (g_prefill_k >= 0) ? g_prefill_k :
+                                (effective_prefill_skip_experts() ? 0 : K);
                 for (int layer = 0; layer < cfg.num_layers; layer++) {
                     int is_full = cfg.is_full_attn[layer];
+                    int layer_K = prefill_K;
+                    if (g_prefill_experts_full_only) {
+                        layer_K = is_full ? K : 0;  // full K at full-attn layers, K=0 at linear
+                    }
                     fused_layer_forward(wf, layer, hidden,
                                         is_full ? kv_caches[layer] : NULL,
                                         is_full ? NULL : layer_states[layer],
                                         pos,
                                         layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                        K, layer_fds[layer]);
+                                        layer_K, layer_fds[layer]);
                 }
 
-                // Discard last layer's expert output — hidden will be overwritten
-                // by the next token's embedding. Only wait for GPU (buffer safety).
                 discard_deferred_experts();
                 pos++;
 
@@ -8792,6 +10125,10 @@ int main(int argc, char **argv) {
                 (prefill_batch_ms - first_tok_ms) / (pt->count - 2) : first_tok_ms;
             printf("  [prefill] %d/%d tokens: %.0f ms (first: %.0f ms, rest avg: %.0f ms)\n",
                    pt->count - 1, pt->count, prefill_batch_ms, first_tok_ms, avg_ms);
+            prefill_only_ms = prefill_batch_ms;
+            printf("[prefill done] %d tokens | %.0f ms | %.1f tok/s\n",
+                   pt->count - 1, prefill_batch_ms,
+                   prefill_batch_ms > 0 ? (pt->count - 1) * 1000.0 / prefill_batch_ms : 0);
         }
 
         // ---- Last prefill token (or single-token prompt) ----
@@ -8939,38 +10276,49 @@ int main(int argc, char **argv) {
         } /* @autoreleasepool */ }
 
         if (g_timing_enabled) timing_print();
-        printf("\n\n--- Statistics ---\n");
-        double total_time = now_ms() - t0;
-        printf("Total time:     %.1f s\n", total_time / 1000.0);
-        printf("TTFT:           %.0f ms\n", ttft_ms);
-        printf("Tokens:         %d generated\n", total_generated);
-        if (total_generated > 1) {
-            double gen_time = total_time - ttft_ms;
-            printf("Generation:     %.1f s (%.2f tok/s)\n",
-                   gen_time / 1000.0, (total_generated - 1) * 1000.0 / gen_time);
-        }
-        printf("Config:         K=%d experts, %d layers\n", K, cfg.num_layers);
-        if (g_expert_cache) {
-            uint64_t total = g_expert_cache->hits + g_expert_cache->misses;
-            printf("Expert cache:   %llu hits, %llu misses (%.1f%% hit rate), %d/%d entries used\n",
-                   g_expert_cache->hits, g_expert_cache->misses,
-                   total > 0 ? 100.0 * g_expert_cache->hits / total : 0.0,
-                   g_expert_cache->num_entries, g_expert_cache->max_entries);
-            cache_telemetry_print(g_expert_cache->hits, g_expert_cache->misses);
-        } else if (g_malloc_cache) {
-            uint64_t total = g_malloc_cache->hits + g_malloc_cache->misses;
-            printf("Expert cache:   malloc %llu hits, %llu misses (%.1f%% hit rate), %d/%d entries used\n",
-                   g_malloc_cache->hits, g_malloc_cache->misses,
-                   total > 0 ? 100.0 * g_malloc_cache->hits / total : 0.0,
-                   g_malloc_cache->num_entries, g_malloc_cache->max_entries);
-            cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
-        }
+        if (!g_stream_mode) {
+            printf("\n\n--- Statistics ---\n");
+            double total_time = now_ms() - t0;
+            printf("Total time:     %.1f s\n", total_time / 1000.0);
+            if (prefill_token_count > 0 && prefill_only_ms > 0) {
+                printf("TTFT:           %.0f ms (prefill: %d tokens, %.1f tok/s%s)\n",
+                       ttft_ms, prefill_token_count,
+                       prefill_token_count * 1000.0 / prefill_only_ms,
+                       prefill_was_batched ? ", batched" : "");
+            } else {
+                printf("TTFT:           %.0f ms\n", ttft_ms);
+            }
+            printf("Tokens:         %d generated\n", total_generated);
+            if (total_generated > 1) {
+                double gen_time = total_time - ttft_ms;
+                printf("Generation:     %.1f s (%.2f tok/s)\n",
+                       gen_time / 1000.0, (total_generated - 1) * 1000.0 / gen_time);
+            }
+            printf("Config:         K=%d experts, %d layers\n", K, cfg.num_layers);
+            if (g_expert_cache) {
+                uint64_t total = g_expert_cache->hits + g_expert_cache->misses;
+                printf("Expert cache:   %llu hits, %llu misses (%.1f%% hit rate), %d/%d entries used\n",
+                       g_expert_cache->hits, g_expert_cache->misses,
+                       total > 0 ? 100.0 * g_expert_cache->hits / total : 0.0,
+                       g_expert_cache->num_entries, g_expert_cache->max_entries);
+                cache_telemetry_print(g_expert_cache->hits, g_expert_cache->misses);
+            } else if (g_malloc_cache) {
+                uint64_t total = g_malloc_cache->hits + g_malloc_cache->misses;
+                printf("Expert cache:   malloc %llu hits, %llu misses (%.1f%% hit rate), %d/%d entries used\n",
+                       g_malloc_cache->hits, g_malloc_cache->misses,
+                       total > 0 ? 100.0 * g_malloc_cache->hits / total : 0.0,
+                       g_malloc_cache->num_entries, g_malloc_cache->max_entries);
+                cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
+            }
 
-        if (g_spec_route_attempts > 0) {
-            printf("Spec routing:   %llu attempts, %llu preloads, %llu hits (%.1f%% prediction accuracy)\n",
-                   g_spec_route_attempts, g_spec_route_preloads, g_spec_route_hits,
-                   g_spec_route_attempts > 0
-                       ? 100.0 * g_spec_route_hits / g_spec_route_attempts : 0.0);
+            if (g_spec_route_attempts > 0) {
+                printf("Spec routing:   %llu attempts, %llu preloads, %llu hits (%.1f%% prediction accuracy)\n",
+                       g_spec_route_attempts, g_spec_route_preloads, g_spec_route_hits,
+                       g_spec_route_attempts > 0
+                           ? 100.0 * g_spec_route_hits / g_spec_route_attempts : 0.0);
+            }
+
+            if (g_freq_tracking) freq_print_analysis(K);
         }
 
         if (g_freq_tracking) freq_print_analysis(K);
@@ -9019,6 +10367,91 @@ void infer_set_fp8_kv(int enabled)          { g_use_fp8_kv = enabled; }
 void infer_set_fused_attention(int enabled) { g_fused_attention_enabled = enabled; }
 void infer_set_fp16_accum(int enabled)      { g_use_fp16_accum = enabled; }
 void infer_set_expert_prefetch(int enabled) { g_expert_prefetch_enabled = enabled; }
+void infer_set_nax(int enabled)            { g_nax_disabled = !enabled; }
+
+void infer_set_prefill_batch(int batch_size) {
+    if (batch_size < 1) batch_size = 1;
+    if (batch_size > MAX_PFB) batch_size = MAX_PFB;
+    g_prefill_batch = batch_size;
+}
+
+void infer_set_prefill_skip_experts(int enabled) {
+    g_prefill_skip_experts = enabled;
+}
+
+void infer_set_prefill_experts_full_only(int enabled) {
+    g_prefill_experts_full_only = enabled;
+}
+
+void infer_request_prefill_abort(void) {
+    atomic_store(&g_prefill_abort, 1);
+}
+
+void infer_clear_prefill_abort(void) {
+    atomic_store(&g_prefill_abort, 0);
+}
+
+int infer_prefill_was_aborted(void) {
+    return atomic_load(&g_prefill_abort);
+}
+
+int infer_prefill(InferContext *ctx, const uint32_t *token_ids, int num_tokens, int pos_start) {
+    if (num_tokens <= 1) return 0;
+    int num_prefill = num_tokens - 1;
+
+    // Embed all prefill tokens into a batch buffer
+    float *embed_batch = malloc((size_t)num_prefill * cfg.hidden_dim * sizeof(float));
+    if (!embed_batch) {
+        fprintf(stderr, "[prefill] ERROR: failed to allocate embed_batch (%d tokens)\n", num_prefill);
+        return 0;
+    }
+    for (int i = 0; i < num_prefill; i++) {
+        embed_lookup(ctx->wf, token_ids[i], embed_batch + (size_t)i * cfg.hidden_dim);
+    }
+
+    int result;
+    if (g_prefill_batch > 1 &&
+        (effective_prefill_skip_experts() || g_prefill_experts_full_only)) {
+        // Batched prefill path
+        result = batched_prefill_k0(ctx->wf, ctx->hidden, embed_batch,
+                                     num_prefill, pos_start,
+                                     ctx->kv_caches, ctx->layer_states,
+                                     ctx->layer_mmaps, ctx->layer_fds, ctx->K);
+    } else {
+        // Per-token prefill fallback
+        int prefill_K = (effective_prefill_skip_experts() || g_prefill_experts_full_only) ? 0 : ctx->K;
+        int i;
+        for (i = 0; i < num_prefill; i++) {
+            if (atomic_load(&g_prefill_abort)) {
+                fprintf(stderr, "[prefill] aborted at token %d/%d\n", i, num_prefill);
+                break;
+            }
+            @autoreleasepool {
+            cache_telemetry_note_token();
+            memcpy(ctx->hidden, embed_batch + (size_t)i * cfg.hidden_dim,
+                   cfg.hidden_dim * sizeof(float));
+            for (int layer = 0; layer < cfg.num_layers; layer++) {
+                int is_full = cfg.is_full_attn[layer];
+                int layer_K = prefill_K;
+                if (g_prefill_experts_full_only) {
+                    layer_K = is_full ? ctx->K : 0;
+                }
+                fused_layer_forward(ctx->wf, layer, ctx->hidden,
+                    is_full ? ctx->kv_caches[layer] : NULL,
+                    is_full ? NULL : (LinearAttnState *)ctx->layer_states[layer],
+                    pos_start + i,
+                    ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
+                    layer_K, ctx->layer_fds[layer]);
+            }
+            discard_deferred_experts();
+            } // @autoreleasepool
+        }
+        result = i;
+    }
+
+    free(embed_batch);
+    return result;
+}
 
 void infer_load_model_config(const char *model_dir) {
     load_model_config(model_dir ? model_dir : "");

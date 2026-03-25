@@ -41,6 +41,11 @@ typedef struct {
                                 // Reducing K cuts I/O proportionally (e.g. K=4 on a K=10 model
                                 // reduces expert reads by 60%). Quality degrades gracefully.
     int cache_io_split;         // >1 = split each expert pread into N page-aligned chunks (fanout), 0/1 = disabled
+    int active_k;               // Override active experts per token (0 = use model default, capped to MAX_K)
+    int prefill_batch;          // Prefill batch size (0/1 = per-token, >1 = batch N tokens per layer)
+    int prefill_skip_experts;   // 1 = skip routed experts for intermediate prefill tokens (shared expert only)
+    int prefill_experts_full_only; // 1 = load routed experts only at full attention layers during prefill
+    int prefill_batched_linear; // 1 = batch linear attention layers during prefill (0 = per-token fallback)
     int verbose;                // 1 = log to stderr, 0 = quiet
 } FlashMoEConfig;
 
@@ -51,6 +56,7 @@ typedef struct {
     int num_layers;
     int num_experts;
     int active_experts_k;
+    int default_experts_k;      // model's num_experts_per_tok
     int hidden_dim;
     int vocab_size;
 
@@ -59,6 +65,12 @@ typedef struct {
     int tokens_generated;
     double total_time_ms;
     double ttft_ms;             // Time to first token
+
+    // Prefill stats
+    double prefill_ms;          // Prefill time (intermediate tokens only)
+    int prefill_tokens;         // Number of intermediate prefill tokens
+    double prefill_tps;         // Prefill tokens per second
+    int prefill_batched;        // 1 if batched path was used
 
     // Memory
     size_t weight_file_bytes;   // Non-expert weights (mmap'd)
@@ -127,6 +139,23 @@ int flashmoe_turn_count(FlashMoEContext *ctx);
 
 // Get a human-readable error string for the last error.
 const char *flashmoe_last_error(FlashMoEContext *ctx);
+
+// ---- Profiling ----
+
+// Enable timing accumulation and reset counters.
+void flashmoe_timing_enable(FlashMoEContext *ctx);
+
+// Build timing report from accumulated data. Caller must free().
+char *flashmoe_timing_report(FlashMoEContext *ctx);
+
+// Convenience: run a self-contained timing profile (blocking). Caller must free().
+char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens);
+
+// ---- Optimization toggles ----
+
+void flashmoe_set_gpu_combine(int enabled);
+void flashmoe_set_gpu_linear_attn(int enabled);
+void flashmoe_set_expert_prefetch(int enabled);
 
 #ifdef __cplusplus
 }

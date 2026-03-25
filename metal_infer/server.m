@@ -61,10 +61,19 @@ static double now_ms(void) {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
-// Check if client disconnected (non-blocking poll for hangup/error)
+// Check if client disconnected (non-blocking poll for hangup/error/EOF)
 static int client_disconnected(int fd) {
-    struct pollfd pfd = { .fd = fd, .events = 0 };
-    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLHUP | POLLERR))) return 1;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    if (poll(&pfd, 1, 0) <= 0) return 0;
+    if (pfd.revents & (POLLHUP | POLLERR)) return 1;
+    // POLLIN without us expecting data means client sent FIN (EOF) or RST —
+    // peek to distinguish real data from connection close
+    if (pfd.revents & POLLIN) {
+        char buf;
+        ssize_t n = recv(fd, &buf, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (n == 0) return 1;   // EOF: client closed connection
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return 1;  // error
+    }
     return 0;
 }
 
@@ -1114,6 +1123,7 @@ static void *inference_worker(void *arg) {
     //  keep the KV state and track the position)
     char active_session[64] = {0};
     int  session_pos = 0;
+    int  session_aborted = 0;  // 1 if last generation was aborted (no EOS in KV cache)
 
     fprintf(stderr, "[worker] Inference worker ready (sys_pos=%d)\n", sys_pos);
 
@@ -1167,10 +1177,22 @@ static void *inference_worker(void *arg) {
             }
             total += strlen(assistant_suffix);
 
+            // If previous generation was aborted, KV cache has a partial assistant
+            // response without EOS/<|im_end|> — prepend closing tokens before the
+            // new user turn so the model sees a clean turn boundary.
+            const char *abort_prefix = "";
+            if (session_aborted) {
+                abort_prefix = "<|im_end|>\n";
+                total += strlen(abort_prefix);
+                session_aborted = 0;
+                fprintf(stderr, "[worker] %s inserting <|im_end|> to close aborted assistant turn\n",
+                        req.request_id);
+            }
+
             template_text = malloc(total);
             snprintf(template_text, total,
-                "\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n%s",
-                user_content, assistant_suffix);
+                "%s\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n%s",
+                abort_prefix, user_content, assistant_suffix);
         } else {
             template_text = build_user_turn(&req);
         }
@@ -1205,6 +1227,7 @@ static void *inference_worker(void *arg) {
             // New session or no cache — restore system prompt snapshot
             infer_restore_state(ctx, sys_snap);
             pos = sys_pos;
+            session_aborted = 0;
             if (req.cache && req.session_id[0]) {
                 strlcpy(active_session, req.session_id, sizeof(active_session));
             } else {
@@ -1215,30 +1238,50 @@ static void *inference_worker(void *arg) {
                     req.session_id[0] ? req.session_id : "(none)");
         }
 
-        // Prefill prompt tokens (with abort check)
-        // Fast prefill: skip routed expert I/O for intermediate tokens (shared expert only)
+        // Prefill prompt tokens — batched when configured, per-token fallback otherwise
+        // Monitor client fd in background so prefill can be aborted on disconnect
+        infer_clear_prefill_abort();
+        dispatch_source_t disconnect_timer = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        int monitor_fd = client_fd;
+        dispatch_source_set_timer(disconnect_timer,
+            dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
+            50 * NSEC_PER_MSEC, 10 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(disconnect_timer, ^{
+            if (client_disconnected(monitor_fd)) {
+                infer_request_prefill_abort();
+                dispatch_source_cancel(disconnect_timer);
+            }
+        });
+        dispatch_resume(disconnect_timer);
+
         double t_prefill = now_ms();
-        int aborted = 0;
-        for (int i = 0; i < pt->count - 1; i++) { @autoreleasepool {
-            if ((i & 3) == 0 && client_disconnected(client_fd)) {
-                fprintf(stderr, "[worker] %s client disconnected during prefill at token %d/%d\n",
-                        req.request_id, i, pt->count);
-                aborted = 1;
-                break;
-            }
-            infer_embed_token(ctx, pt->ids[i]);
-            for (int layer = 0; layer < cfg.num_layers; layer++) {
-                infer_forward_layer(ctx, layer, pos);
-            }
-            infer_discard_deferred_nowait();
-            pos++;
-        } /* @autoreleasepool */ }
-        if (aborted) {
+        if (pt->count > 1) {
+            int prefilled = infer_prefill(ctx, pt->ids, pt->count, pos);
+            pos += prefilled;
+        }
+
+        dispatch_source_cancel(disconnect_timer);
+
+        // Check if prefill was aborted by client disconnect
+        if (infer_prefill_was_aborted()) {
+            double prefill_ms = now_ms() - t_prefill;
+            fprintf(stderr, "[worker] %s ABORTED during prefill after %.0fms\n",
+                    req.request_id, prefill_ms);
+            infer_clear_prefill_abort();
+            // Partial prefill leaves KV cache in inconsistent state — must reset.
+            // Restore system prompt snapshot so the next request starts clean.
+            infer_restore_state(ctx, sys_snap);
+            active_session[0] = '\0';
+            session_pos = 0;
+            session_aborted = 0;
             infer_free_tokens(pt);
             free_completion_request(&req);
             close(client_fd);
             continue;
         }
+        infer_clear_prefill_abort();
+
         // Last prompt token — full completion
         infer_embed_token(ctx, pt->ids[pt->count - 1]);
         for (int layer = 0; layer < cfg.num_layers; layer++) {
@@ -1425,23 +1468,29 @@ static void *inference_worker(void *arg) {
 
         // Save session position for KV cache continuity
         // (pos now includes all prefill + generated tokens)
-        if (req.cache && req.session_id[0] &&
-            !(finish_reason && strcmp(finish_reason, "abort") == 0)) {
+        int is_abort = (finish_reason && strcmp(finish_reason, "abort") == 0);
+        if (req.cache && req.session_id[0]) {
             session_pos = pos;
-            fprintf(stderr, "[worker] %s session_pos=%d (session=%s)\n",
-                    req.request_id, session_pos, active_session);
+            if (is_abort) {
+                // KV cache is valid at pos but has no EOS — flag for next continuation
+                session_aborted = 1;
+                fprintf(stderr, "[worker] %s session_pos=%d (session=%s) [ABORTED — cache preserved]\n",
+                        req.request_id, session_pos, active_session);
+            } else {
+                session_aborted = 0;
+                fprintf(stderr, "[worker] %s session_pos=%d (session=%s)\n",
+                        req.request_id, session_pos, active_session);
+            }
         }
 
         double gen_ms = now_ms() - t_gen;
         double tok_per_sec = gen_count > 0 ? gen_count * 1000.0 / gen_ms : 0.0;
         fprintf(stderr, "[worker] %s generated=%d tokens in %.0fms (%.2f tok/s)%s\n",
                 req.request_id, gen_count, gen_ms, tok_per_sec,
-                (finish_reason && strcmp(finish_reason, "abort") == 0) ? " [ABORTED]" : "");
+                is_abort ? " [ABORTED]" : "");
 
-        // On abort: invalidate session and cleanup
-        if (finish_reason && strcmp(finish_reason, "abort") == 0) {
-            active_session[0] = '\0';
-            session_pos = 0;
+        // On abort: cleanup but preserve session cache
+        if (is_abort) {
             free(response_buf);
             free_completion_request(&req);
             close(client_fd);
@@ -1576,15 +1625,11 @@ static InferStateSnapshot *precache_system_prompt(InferContext *ctx) {
     // so this is effectively a no-op on fresh context, avoiding 5+ GB memset)
     infer_reset_state(ctx);
 
-    // Prefill (fast: skip routed experts for intermediate tokens)
+    // Prefill — batched when configured, per-token fallback otherwise
     int pos = 0;
-    for (int i = 0; i < pt->count - 1; i++) {
-        infer_embed_token(ctx, pt->ids[i]);
-        for (int layer = 0; layer < cfg.num_layers; layer++) {
-            infer_forward_layer(ctx, layer, pos);
-        }
-        infer_discard_deferred_nowait();
-        pos++;
+    if (pt->count > 1) {
+        int prefilled = infer_prefill(ctx, pt->ids, pt->count, pos);
+        pos += prefilled;
     }
     // Last token: full forward (need accurate hidden state)
     infer_embed_token(ctx, pt->ids[pt->count - 1]);
@@ -1624,6 +1669,11 @@ static void print_usage(void) {
     printf("  --no-fused-expert  Disable fused gate+up+SwiGLU expert kernel\n");
     printf("  --no-cmd-merge     Disable CMD1+CMD2 merge for linear attention\n");
     printf("  --expert-prefetch  Enable cross-layer expert prefetch\n");
+    printf("  --pfb N            Enable batched prefill (recommended 64-128)\n");
+    printf("  --prefill-skip-experts  Skip routed experts during prefill (fastest)\n");
+    printf("  --prefill-experts-full-only  K=0 for linear layers, full K for full-attn (best quality)\n");
+    printf("  --nax                Enable NAX tensor matmul for LM head (Metal 4+, SLOWER for M=1 decode)\n");
+    printf("  --no-nax             Disable NAX (default)\n");
     printf("  --help             This message\n");
 }
 
@@ -1655,6 +1705,11 @@ int main(int argc, char **argv) {
             {"cmd-merge",     no_argument,   0, 1008},
             {"no-cmd-merge",  no_argument,   0, 1005},
             {"expert-prefetch", no_argument, 0, 1006},
+            {"pfb",               required_argument, 0, 1010},
+            {"prefill-skip-experts", no_argument,    0, 1011},
+            {"prefill-experts-full-only", no_argument, 0, 1012},
+            {"nax",           no_argument,       0, 1013},
+            {"no-nax",        no_argument,       0, 1014},
             {"help",      no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -1678,6 +1733,11 @@ int main(int argc, char **argv) {
                 case 1006: infer_set_expert_prefetch(1); break;
                 case 1007: infer_set_fused_expert(1); break;
                 case 1008: infer_set_cmd_merge(1); break;
+                case 1010: infer_set_prefill_batch(atoi(optarg)); break;
+                case 1011: infer_set_prefill_skip_experts(1); break;
+                case 1012: infer_set_prefill_experts_full_only(1); break;
+                case 1013: infer_set_nax(1); break;   // --nax: enable
+                case 1014: infer_set_nax(0); break;   // --no-nax: disable
                 case 'h': print_usage(); return 0;
                 default: print_usage(); return 1;
             }

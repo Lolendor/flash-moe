@@ -504,6 +504,13 @@ createApp({
       if (!activeChat.value) { newChat(); await nextTick(); }
       var chat = activeChat.value;
 
+      // Remove trailing empty assistant message (leftover from prefill abort)
+      while (chat.messages.length > 0 &&
+             chat.messages[chat.messages.length - 1].role === 'assistant' &&
+             !chat.messages[chat.messages.length - 1].content) {
+        chat.messages.pop();
+      }
+
       chat.messages.push({ role: 'user', content: text });
       if (chat.title === 'New Chat') {
         chat.title = text.slice(0, 50) + (text.length > 50 ? '\u2026' : '');

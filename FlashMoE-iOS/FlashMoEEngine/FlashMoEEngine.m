@@ -13,6 +13,7 @@
 // Unity build — include the entire inference engine
 // This gives us access to all static functions and globals
 #include "../../metal_infer/infer.m"
+#include "../../metal_infer/batched_prefill.h"
 
 #include "FlashMoEEngine.h"
 #include <stdatomic.h>
@@ -50,6 +51,11 @@ struct FlashMoEContext {
     int tokens_generated;
     double total_time_ms;
     double ttft_ms;
+
+    // Prefill stats
+    double prefill_ms;           // total prefill time (excluding last token + LM head)
+    int prefill_tokens;          // number of intermediate prefill tokens
+    int prefill_batched;         // 1 if batched path was used
 
     // Error state
     char last_error[512];
@@ -208,6 +214,35 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             ctx->K = cfg.num_experts_per_tok;
         }
 
+        // Prefill batching settings
+        g_prefill_batch = config->prefill_batch > 1 ? config->prefill_batch : 1;
+        if (g_prefill_batch > MAX_PFB) g_prefill_batch = MAX_PFB;
+        g_prefill_skip_experts = config->prefill_skip_experts ? 1 : 0;
+        g_prefill_experts_full_only = config->prefill_experts_full_only ? 1 : 0;
+        g_disable_batched_linear = config->prefill_batched_linear ? 0 : 1;
+        if (config->verbose && g_prefill_batch > 1) {
+            NSLog(@"[FlashMoE] Prefill: batch=%d, skip_experts=%d, experts_full_only=%d, batched_linear=%d",
+                  g_prefill_batch, g_prefill_skip_experts, g_prefill_experts_full_only, !g_disable_batched_linear);
+        }
+
+        // KV cache sizing — allocate only what we need
+        {
+            int default_ctx = 8192;
+#if TARGET_OS_IOS
+            if (![[NSProcessInfo processInfo] isMacCatalystApp]) {
+                default_ctx = 2048;  // iPhone: conserve memory
+            }
+#endif
+            int ctx_limit = (config->max_context > 0) ? config->max_context : default_ctx;
+            if (ctx_limit > MAX_SEQ_LEN) ctx_limit = MAX_SEQ_LEN;
+            g_kv_seq_len = ctx_limit;
+            size_t kv_per_cache = (size_t)ctx_limit * g_cfg.num_kv_heads * g_cfg.head_dim * sizeof(float);
+            if (config->verbose) {
+                NSLog(@"[FlashMoE] KV cache: %d positions (%.1f MB per cache x %d layers)",
+                      ctx_limit, kv_per_cache / 1e6, g_cfg.num_full_attn_layers);
+            }
+        }
+
         // Safety: cap K to MAX_K to prevent buffer overflow on multi-expert buffers
         if (ctx->K > MAX_K) {
             NSLog(@"[FlashMoE] WARNING: K=%d exceeds MAX_K=%d, capping to %d", ctx->K, MAX_K, MAX_K);
@@ -317,6 +352,18 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
                         }
                     }
                 }
+            }
+        }
+
+        // Log expert I/O mode
+        {
+            int mmap_count = 0;
+            for (int i = 0; i < g_cfg.num_layers; i++) {
+                if (ctx->layer_mmaps[i] != MAP_FAILED) mmap_count++;
+            }
+            if (config->verbose) {
+                NSLog(@"[experts] %d/%d layers opened, %d mmap'd, %d pread-only",
+                      g_cfg.num_layers, g_cfg.num_layers, mmap_count, g_cfg.num_layers - mmap_count);
             }
         }
 
@@ -636,29 +683,88 @@ int flashmoe_generate(
             }
         }
 
-        // ---- Prefill intermediate tokens (discard expert output) ----
+        // ---- Prefill intermediate tokens ----
         if (pt->count > 1) {
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
-                if (atomic_load(&ctx->cancelled)) {
-                    free(embed_batch);
-                    free(pt->ids); free(pt);
-                    return ctx->tokens_generated;
-                }
+            double prefill_start = now_ms();
+            int num_prefill = pt->count - 1;
 
-                memcpy(ctx->hidden, embed_batch + (size_t)token_idx * cfg.hidden_dim,
-                       cfg.hidden_dim * sizeof(float));
+            if (g_prefill_batch > 1 && (effective_prefill_skip_experts() || g_prefill_experts_full_only)) {
+                NSLog(@"[prefill] BATCHED path: %d tokens, batch=%d, skip_experts=%d, experts_full_only=%d, batched_linear=%d",
+                      num_prefill, g_prefill_batch, effective_prefill_skip_experts(), g_prefill_experts_full_only, !g_disable_batched_linear);
+                pos += batched_prefill_k0(ctx->wf, ctx->hidden, embed_batch, num_prefill, pos,
+                                          ctx->kv_caches, ctx->layer_states,
+                                          ctx->layer_mmaps, ctx->layer_fds, K);
 
-                for (int layer = 0; layer < cfg.num_layers; layer++) {
-                    int is_full = cfg.is_full_attn[layer];
-                    fused_layer_forward(ctx->wf, layer, ctx->hidden,
-                                        is_full ? ctx->kv_caches[layer] : NULL,
-                                        is_full ? NULL : ctx->layer_states[layer],
-                                        pos,
-                                        ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
-                                        K, ctx->layer_fds[layer]);
+                double prefill_total = now_ms() - prefill_start;
+                double prefill_tps = prefill_total > 0 ? num_prefill * 1000.0 / prefill_total : 0;
+                ctx->tokens_per_second = prefill_tps;
+                ctx->tokens_generated = -num_prefill;
+                ctx->prefill_ms = prefill_total;
+                ctx->prefill_tokens = num_prefill;
+                ctx->prefill_batched = 1;
+                if (callback) {
+                    char prefill_status[128];
+                    snprintf(prefill_status, sizeof(prefill_status),
+                             "[prefill %d/%d batch=%d linear=%s skip_experts=%d]",
+                             num_prefill, num_prefill, g_prefill_batch,
+                             g_disable_batched_linear ? "per-tok" : "batched",
+                             effective_prefill_skip_experts());
+                    callback(prefill_status, -1, -num_prefill, prefill_tps, user_data);
                 }
-                discard_deferred_experts();
-                pos++;
+                NSLog(@"[prefill] %d tokens in %.0f ms (%.1f tok/s, batch=%d, batched_linear=%d, skip_experts=%d)",
+                      num_prefill, prefill_total, prefill_tps, g_prefill_batch, !g_disable_batched_linear,
+                      effective_prefill_skip_experts());
+            } else {
+                NSLog(@"[prefill] PER-TOKEN path: batch=%d, skip_experts=%d (batched requires skip_experts=1)",
+                      g_prefill_batch, effective_prefill_skip_experts());
+                for (int token_idx = 0; token_idx < num_prefill; token_idx++) {
+                    if (atomic_load(&ctx->cancelled)) {
+                        free(embed_batch);
+                        free(pt->ids); free(pt);
+                        return ctx->tokens_generated;
+                    }
+
+                    @autoreleasepool {
+                    memcpy(ctx->hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
+
+                    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        int layer_K = K;
+                        if (g_prefill_experts_full_only) {
+                            layer_K = is_full ? K : 0;
+                        }
+                        fused_layer_forward(ctx->wf, layer, ctx->hidden,
+                                            is_full ? ctx->kv_caches[layer] : NULL,
+                                            is_full ? NULL : ctx->layer_states[layer],
+                                            pos,
+                                            ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
+                                            layer_K, ctx->layer_fds[layer]);
+                    }
+                    discard_deferred_experts();
+                    pos++;
+                    } // @autoreleasepool — drain Metal objects per prefill token
+
+                    double prefill_elapsed = now_ms() - prefill_start;
+                    double prefill_tps = prefill_elapsed > 0 ? (token_idx + 1) * 1000.0 / prefill_elapsed : 0;
+                    ctx->tokens_per_second = prefill_tps;
+                    ctx->tokens_generated = -(token_idx + 1);
+                    if (callback) {
+                        char prefill_status[128];
+                        snprintf(prefill_status, sizeof(prefill_status),
+                                 "[prefill %d/%d per-token configured_batch=%d skip_experts=%d]",
+                                 token_idx + 1, num_prefill, g_prefill_batch, effective_prefill_skip_experts());
+                        callback(prefill_status, -1, -(token_idx + 1), prefill_tps, user_data);
+                    }
+                }
+                double prefill_total = now_ms() - prefill_start;
+                ctx->prefill_ms = prefill_total;
+                ctx->prefill_tokens = num_prefill;
+                ctx->prefill_batched = 0;
+                NSLog(@"[prefill] %d tokens in %.0f ms (%.1f tok/s, batch=1, skip_experts=%d)",
+                      num_prefill, prefill_total,
+                      prefill_total > 0 ? num_prefill * 1000.0 / prefill_total : 0,
+                      effective_prefill_skip_experts());
             }
         }
 
@@ -859,27 +965,40 @@ int flashmoe_generate_continuation(
         }
 
         if (pt->count > 1) {
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
-                if (atomic_load(&ctx->cancelled)) {
-                    free(embed_batch);
-                    free(pt->ids); free(pt);
-                    return ctx->tokens_generated;
-                }
+            int num_prefill = pt->count - 1;
+            if (g_prefill_batch > 1 && (effective_prefill_skip_experts() || g_prefill_experts_full_only)) {
+                pos += batched_prefill_k0(ctx->wf, ctx->hidden, embed_batch, num_prefill, pos,
+                                          ctx->kv_caches, ctx->layer_states,
+                                          ctx->layer_mmaps, ctx->layer_fds, K);
+            } else {
+                for (int token_idx = 0; token_idx < num_prefill; token_idx++) {
+                    if (atomic_load(&ctx->cancelled)) {
+                        free(embed_batch);
+                        free(pt->ids); free(pt);
+                        return ctx->tokens_generated;
+                    }
 
-                memcpy(ctx->hidden, embed_batch + (size_t)token_idx * cfg.hidden_dim,
-                       cfg.hidden_dim * sizeof(float));
+                    @autoreleasepool {
+                    memcpy(ctx->hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
 
-                for (int layer = 0; layer < cfg.num_layers; layer++) {
-                    int is_full = cfg.is_full_attn[layer];
-                    fused_layer_forward(ctx->wf, layer, ctx->hidden,
-                                        is_full ? ctx->kv_caches[layer] : NULL,
-                                        is_full ? NULL : ctx->layer_states[layer],
-                                        pos,
-                                        ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
-                                        K, ctx->layer_fds[layer]);
+                    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        int layer_K = K;
+                        if (g_prefill_experts_full_only) {
+                            layer_K = is_full ? K : 0;
+                        }
+                        fused_layer_forward(ctx->wf, layer, ctx->hidden,
+                                            is_full ? ctx->kv_caches[layer] : NULL,
+                                            is_full ? NULL : ctx->layer_states[layer],
+                                            pos,
+                                            ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
+                                            layer_K, ctx->layer_fds[layer]);
+                    }
+                    discard_deferred_experts();
+                    pos++;
+                    } // @autoreleasepool
                 }
-                discard_deferred_experts();
-                pos++;
             }
         }
 
@@ -1058,8 +1177,25 @@ void flashmoe_get_stats(FlashMoEContext *ctx, FlashMoEStats *stats) {
         stats->num_layers = cfg.num_layers;
         stats->num_experts = cfg.num_experts;
         stats->active_experts_k = ctx->K;
+        stats->default_experts_k = g_cfg.num_experts_per_tok;
         stats->hidden_dim = cfg.hidden_dim;
         stats->vocab_size = cfg.vocab_size;
+        stats->num_attn_heads = g_cfg.num_attn_heads;
+        stats->num_kv_heads = g_cfg.num_kv_heads;
+        stats->head_dim = g_cfg.head_dim;
+        stats->moe_intermediate = g_cfg.moe_intermediate;
+        stats->is_smoke_test = (g_cfg.num_experts < 512) ? 1 : 0;
+
+        // Determine expert quantization bits
+        if (g_use_2bit)          stats->expert_quant_bits = 2;
+        else if (g_use_q3_experts) stats->expert_quant_bits = 3;
+        else                      stats->expert_quant_bits = 4;
+
+        // Dense weights are MLX 4-bit (group_size=64) with BF16 scales+biases
+        // Effective bits/param: 4 (weight) + 16/64 (scale) + 16/64 (bias) = 4.5 bits/param
+        stats->dense_quant_bits = 4;
+        stats->dense_avg_bits = 4.5f;
+
         stats->weight_file_bytes = ctx->wf ? ctx->wf->size : 0;
 
         // Compute total expert file bytes
@@ -1079,6 +1215,229 @@ void flashmoe_get_stats(FlashMoEContext *ctx, FlashMoEStats *stats) {
     stats->tokens_generated = ctx->tokens_generated;
     stats->total_time_ms = ctx->total_time_ms;
     stats->ttft_ms = ctx->ttft_ms;
+
+    stats->prefill_ms = ctx->prefill_ms;
+    stats->prefill_tokens = ctx->prefill_tokens;
+    stats->prefill_tps = ctx->prefill_ms > 0 ? ctx->prefill_tokens * 1000.0 / ctx->prefill_ms : 0;
+    stats->prefill_batched = ctx->prefill_batched;
+}
+
+// ============================================================================
+// Profiling — run short generation with timing and return report string
+// ============================================================================
+
+// Helper: get device machine identifier (e.g. "iPad16,6")
+static const char *get_device_machine(void) {
+    static char machine[64] = {0};
+    if (machine[0]) return machine;
+    struct utsname u;
+    if (uname(&u) == 0) {
+        strlcpy(machine, u.machine, sizeof(machine));
+    } else {
+        strlcpy(machine, "unknown", sizeof(machine));
+    }
+    return machine;
+}
+
+// Helper: map machine ID to marketing name
+static const char *get_device_name(void) {
+    const char *m = get_device_machine();
+    // iPad Pro M4
+    if (strncmp(m, "iPad16,3", 8) == 0 || strncmp(m, "iPad16,4", 8) == 0) return "iPad Pro 11\" (M4)";
+    if (strncmp(m, "iPad16,5", 8) == 0 || strncmp(m, "iPad16,6", 8) == 0) return "iPad Pro 13\" (M4)";
+    // iPad Air M3
+    if (strncmp(m, "iPad15,3", 8) == 0 || strncmp(m, "iPad15,4", 8) == 0) return "iPad Air 11\" (M3)";
+    if (strncmp(m, "iPad15,5", 8) == 0 || strncmp(m, "iPad15,6", 8) == 0) return "iPad Air 13\" (M3)";
+    // iPad Pro M2
+    if (strncmp(m, "iPad14,5", 8) == 0 || strncmp(m, "iPad14,6", 8) == 0) return "iPad Pro 11\" (M2)";
+    if (strncmp(m, "iPad14,7", 8) == 0 || strncmp(m, "iPad14,8", 8) == 0) return "iPad Pro 12.9\" (M2)";
+    // iPad Air M2
+    if (strncmp(m, "iPad14,10", 9) == 0 || strncmp(m, "iPad14,11", 9) == 0) return "iPad Air 11\" (M2)";
+    // iPad Pro M1
+    if (strncmp(m, "iPad13,4", 8) == 0 || strncmp(m, "iPad13,5", 8) == 0) return "iPad Pro 11\" (M1)";
+    if (strncmp(m, "iPad13,8", 8) == 0 || strncmp(m, "iPad13,9", 8) == 0) return "iPad Pro 12.9\" (M1)";
+    // iPad Air M1
+    if (strncmp(m, "iPad13,16", 9) == 0 || strncmp(m, "iPad13,17", 9) == 0) return "iPad Air (M1)";
+    // iPhone 17 Pro
+    if (strncmp(m, "iPhone18,1", 10) == 0) return "iPhone 17 Pro";
+    if (strncmp(m, "iPhone18,2", 10) == 0) return "iPhone 17 Pro Max";
+    if (strncmp(m, "iPhone18,3", 10) == 0) return "iPhone 17 Air";
+    if (strncmp(m, "iPhone18,4", 10) == 0) return "iPhone 17";
+    // iPhone 16 Pro
+    if (strncmp(m, "iPhone17,1", 10) == 0) return "iPhone 16 Pro";
+    if (strncmp(m, "iPhone17,2", 10) == 0) return "iPhone 16 Pro Max";
+    if (strncmp(m, "iPhone17,3", 10) == 0) return "iPhone 16";
+    // iPhone 15 Pro
+    if (strncmp(m, "iPhone16,1", 10) == 0) return "iPhone 15 Pro";
+    if (strncmp(m, "iPhone16,2", 10) == 0) return "iPhone 15 Pro Max";
+    // Mac (running as Designed for iPad)
+    if (strncmp(m, "arm64", 5) == 0) return "Mac (Apple Silicon)";
+    return m;  // fallback to raw machine ID
+}
+
+// Enable timing accumulation and reset counters
+void flashmoe_timing_enable(FlashMoEContext *ctx) {
+    (void)ctx;
+    g_timing_enabled = 1;
+    memset(&g_timing, 0, sizeof(g_timing));
+}
+
+// Build timing report from accumulated data. Caller must free().
+char *flashmoe_timing_report(FlashMoEContext *ctx) {
+    if (!ctx) return NULL;
+
+    g_timing_enabled = 0;
+
+    char *buf = malloc(8192);
+    if (!buf) return NULL;
+    int pos = 0;
+    int n = g_timing.count;
+    int toks = g_timing.token_count;
+
+    // ---- Device & Model header ----
+    const char *model_path = g_model_path_for_tokenizer ? g_model_path_for_tokenizer : "unknown";
+    const char *model_name = strrchr(model_path, '/');
+    model_name = model_name ? model_name + 1 : model_path;
+
+    uint64_t total_ram = [NSProcessInfo processInfo].physicalMemory;
+    double avail_ram_mb = 0;
+#if TARGET_OS_IOS
+    avail_ram_mb = (double)os_proc_available_memory() / (1024 * 1024);
+#endif
+
+    pos += snprintf(buf + pos, 8192 - pos,
+        "Device:  %s (%s)\n"
+        "RAM:     %.0f GB total, %.0f MB free\n"
+        "OS:      %s %s\n"
+        "Model:   %s\n"
+        "Quant:   %d-bit experts, K=%d\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n",
+        get_device_name(), get_device_machine(),
+        (double)total_ram / (1024.0 * 1024 * 1024), avail_ram_mb,
+#if TARGET_OS_IOS
+        [[[UIDevice currentDevice] systemName] UTF8String],
+        [[[UIDevice currentDevice] systemVersion] UTF8String],
+#else
+        "macOS",
+        [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String],
+#endif
+        model_name,
+        g_use_2bit ? 2 : (g_use_q3_experts ? 3 : 4), ctx->K);
+
+    if (n == 0 || toks == 0) {
+        pos += snprintf(buf + pos, 8192 - pos, "No timing data (%d layers timed, %d tokens)\n", n, toks);
+        return buf;
+    }
+
+    // Per-token decode breakdown
+    double dense_attn_ms = (g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.cpu_attn) / n * g_cfg.num_layers;
+    double oproj_shared_ms = (g_timing.cmd2_encode + g_timing.cmd2_wait + g_timing.routing_cpu) / n * g_cfg.num_layers;
+    double expert_io_ms = g_timing.expert_io / n * g_cfg.num_layers;
+    double expert_compute_ms = (g_timing.cmd3_encode + g_timing.deferred_wait + g_timing.deferred_cpu) / n * g_cfg.num_layers;
+    double lm_ms = g_timing.lm_head / toks;
+    double total_ms = dense_attn_ms + oproj_shared_ms + expert_io_ms + expert_compute_ms + lm_ms;
+
+    double linear_ms = (g_timing.count_linear > 0) ? g_timing.total_linear / g_timing.count_linear * g_cfg.num_linear_layers : 0;
+    double full_ms = (g_timing.count_full > 0) ? g_timing.total_full / g_timing.count_full * g_cfg.num_full_attn_layers : 0;
+
+    pos += snprintf(buf + pos, 8192 - pos,
+        "\nDecode Breakdown (%d tokens)\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", toks);
+    pos += snprintf(buf + pos, 8192 - pos,
+        "Dense/attn (CMD1):  %5.1f ms  %4.1f%%\n"
+        "  GatedDeltaNet:    %5.1f ms  (%d layers)\n"
+        "  Full attention:   %5.1f ms  (%d layers)\n",
+        dense_attn_ms, 100*dense_attn_ms/total_ms,
+        linear_ms, g_cfg.num_linear_layers,
+        full_ms, g_cfg.num_full_attn_layers);
+    pos += snprintf(buf + pos, 8192 - pos,
+        "o_proj+shared (CMD2): %3.1f ms  %4.1f%%\n",
+        oproj_shared_ms, 100*oproj_shared_ms/total_ms);
+    pos += snprintf(buf + pos, 8192 - pos,
+        "Expert I/O (SSD):   %5.1f ms  %4.1f%%\n",
+        expert_io_ms, 100*expert_io_ms/total_ms);
+    pos += snprintf(buf + pos, 8192 - pos,
+        "Expert compute:     %5.1f ms  %4.1f%%\n",
+        expert_compute_ms, 100*expert_compute_ms/total_ms);
+    pos += snprintf(buf + pos, 8192 - pos,
+        "LM head:            %5.1f ms  %4.1f%%\n",
+        lm_ms, 100*lm_ms/total_ms);
+
+    // Compute effective SSD throughput
+    int expert_size = g_use_2bit ? EXPERT_SIZE_2BIT :
+                      g_use_q3_experts ? EXPERT_SIZE_Q3_HYBRID : EXPERT_SIZE;
+    double io_bytes_per_tok = (double)ctx->K * g_cfg.num_layers * expert_size;
+    double io_gb_per_tok = io_bytes_per_tok / (1024.0 * 1024 * 1024);
+    double ssd_gbps = (expert_io_ms > 0) ? io_gb_per_tok / (expert_io_ms / 1000.0) : 0;
+
+    pos += snprintf(buf + pos, 8192 - pos,
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Total per token:    %5.1f ms  (%.1f tok/s)\n"
+        "TTFT:               %5.0f ms\n"
+        "Prefill:            %5.0f ms  (%d tokens, %.1f tok/s%s)\n"
+        "Expert quant:       %d-bit\n"
+        "Experts:            %d (K=%d)\n"
+        "Expert I/O/tok:     %.2f GB\n"
+        "SSD throughput:     %.1f GB/s\n",
+        total_ms, 1000.0/total_ms,
+        ctx->ttft_ms,
+        ctx->prefill_ms, ctx->prefill_tokens,
+        ctx->prefill_ms > 0 ? ctx->prefill_tokens * 1000.0 / ctx->prefill_ms : 0,
+        ctx->prefill_batched ? ", batched" : "",
+        g_use_2bit ? 2 : (g_use_q3_experts ? 3 : 4),
+        g_cfg.num_experts, ctx->K,
+        io_gb_per_tok, ssd_gbps);
+
+    // Per-layer avg
+    pos += snprintf(buf + pos, 8192 - pos,
+        "\nPer-Layer Avg (ms):\n"
+        "  deferred_wait:  %6.3f\n"
+        "  cmd1 (submit):  %6.3f\n"
+        "  cmd1 (wait):    %6.3f\n"
+        "  cpu_attn:       %6.3f\n"
+        "  cmd2 (encode):  %6.3f\n"
+        "  cmd2 (wait):    %6.3f\n"
+        "  routing_cpu:    %6.3f\n"
+        "  expert_io:      %6.3f\n"
+        "  cmd3_encode:    %6.3f\n",
+        g_timing.deferred_wait / n,
+        g_timing.cmd1_submit / n,
+        g_timing.cmd1_wait / n,
+        g_timing.cpu_attn / n,
+        g_timing.cmd2_encode / n,
+        g_timing.cmd2_wait / n,
+        g_timing.routing_cpu / n,
+        g_timing.expert_io / n,
+        g_timing.cmd3_encode / n);
+
+    NSLog(@"[profile]\n%s", buf);
+    return buf;
+}
+
+// Convenience: run a self-contained timing profile (blocking)
+char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens) {
+    if (!ctx || !ctx->loaded) return NULL;
+    flashmoe_timing_enable(ctx);
+    flashmoe_reset(ctx);
+    flashmoe_generate(ctx, "What is Apple Neural Engine?", num_tokens, NULL, NULL);
+    return flashmoe_timing_report(ctx);
+}
+
+// ---- Optimization toggles ----
+
+void flashmoe_set_gpu_combine(int enabled) {
+    g_disable_gpu_combine = !enabled;
+    NSLog(@"[opt] GPU combine (fused CMD3): %s", enabled ? "ON" : "OFF");
+}
+
+void flashmoe_set_gpu_linear_attn(int enabled) {
+    gpu_linear_attn_enabled = enabled;
+    NSLog(@"[opt] GPU linear attention: %s", enabled ? "ON" : "OFF");
+}
+
+void flashmoe_set_expert_prefetch(int enabled) {
+    g_disable_expert_prefetch = !enabled;
+    NSLog(@"[opt] Expert prefetch (async pread): %s", enabled ? "ON" : "OFF");
 }
 
 int flashmoe_validate_model(const char *model_path) {
@@ -1121,4 +1480,3 @@ const char *flashmoe_last_error(FlashMoEContext *ctx) {
     if (!ctx) return "NULL context";
     return ctx->last_error;
 }
-
